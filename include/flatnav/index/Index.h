@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 #include <optional>
+#include <flatnav/util/PhaseProfiler.h>
 
 using flatnav::distances::DistanceInterface;
 using flatnav::util::VisitedSet;
@@ -392,6 +393,8 @@ class Index {
     PriorityQueue neighbors = beamSearch(/* query = */ query,
                                          /* entry_node = */ entry_node,
                                          /* buffer_size = */ std::max(ef_search, K));
+                                         
+    flatnav::profiling::dump("my_query");
     
     while (neighbors.size() > static_cast<size_t>(K)) {
       neighbors.pop();
@@ -405,6 +408,9 @@ class Index {
       results[i] = {dist, *(getNodeLabel(node_id))};
       neighbors.pop();
     }
+
+    flatnav::profiling::reset();
+
 
     return results;
   }
@@ -446,20 +452,28 @@ class Index {
         if(s.execution_state == QueryExecutionState::Done) continue;
 
         switch (s.execution_state){
-          case QueryExecutionState::Unscheduled:
+          case QueryExecutionState::Unscheduled: {
             popCandidateOrFinish(
               s, K, buffer_size, num_initializations, queries,
               num_queries, next_query, slot_query_idx[q],
               all_results, active_count);
             break;
-          case QueryExecutionState::ProcessingLinks:
+          }
+          case QueryExecutionState::ProcessingLinks: {
+            FN_PHASE_BEGIN(Node);
             processOneLink(s, buffer_size);
+            FN_PHASE_END(Node);
             break;
+          }
           case QueryExecutionState::Done:
             break;
         }
       }
     }
+
+    flatnav::profiling::dump("my_query");
+    flatnav::profiling::reset();
+
     return all_results;
   }
 
@@ -489,6 +503,7 @@ class Index {
       );
     }
 
+    FN_PHASE_BEGIN(Initialize);
     size_t queries_remaning = num_queries;
     while(queries_remaning > 0) {
       for(size_t q = 0; q < num_queries; q++) {
@@ -515,6 +530,7 @@ class Index {
         }
       }
     }
+    FN_PHASE_END(Initialize);
 
     std::vector<std::pair<node_id_t, float>> results(num_queries);
     for(size_t q = 0; q < num_queries; q++) {
@@ -587,9 +603,11 @@ class Index {
         num_queries, next_query, slot_query_idx, all_results, active_count);
     }
 
+    FN_PHASE_BEGIN(Select);
     auto [neg_dist, node_id] = s.candidates.front();
     std::pop_heap(s.candidates.begin(), s.candidates.end(), cmp);
     s.candidates.pop_back();
+    FN_PHASE_END(Select);
 
 
     // We ain't finding anything better, finish the search for this query
@@ -617,6 +635,9 @@ class Index {
                    size_t& active_count) {
     finishQuery(s, K, all_results[slot_query_idx]);
 
+    flatnav::profiling::dump("my_query");
+    flatnav::profiling::reset();
+
     if (next_query >= num_queries) {
       active_count--;
       return false;
@@ -626,8 +647,10 @@ class Index {
     next_query++;
 
     s.query = static_cast<const char*>(queries) + slot_query_idx * _data_size_bytes;
+    FN_PHASE_BEGIN(Initialize);
     auto init_result = initializeSearch(s.query, num_initializations);
     seedBeamSearchState(s, init_result, buffer_size);
+    FN_PHASE_END(Initialize);
     return true;
   }
 
@@ -646,11 +669,14 @@ class Index {
       if(s.visited.count(neighbor_id) > 0) continue;
       s.visited.insert(neighbor_id);
 
+      FN_PHASE_BEGIN(Dist);
       float dist = _distance->distance(s.query, getNodeData(neighbor_id), true);
+      FN_PHASE_END(Dist);
       if (_collect_stats) {
         _distance_computations.fetch_add(1);
       }
 
+      FN_PHASE_BEGIN(CI);
       if (s.neighbors.size() < buffer_size || dist < s.max_dist) {
         s.candidates.emplace_back(-dist, neighbor_id);
         std::push_heap(s.candidates.begin(), s.candidates.end(), cmp);
@@ -666,6 +692,7 @@ class Index {
           s.max_dist = s.neighbors.front().first;
         }
       }
+      FN_PHASE_END(CI);
 
       break; // yield
     }
@@ -888,8 +915,15 @@ class Index {
     _mm_prefetch(getNodeData(entry_node), _MM_HINT_T0);
 #endif
 
+    // // Dereference data to ensure it's loaded into cache before timing Dist phase
+    // volatile float* entry_data_ptr = (float*)getNodeData(entry_node);
+    // volatile float ignored_val = entry_data_ptr[0];
+    // (void)ignored_val;  // Suppress unused warning
+    
+    FN_PHASE_BEGIN(Initialize);
     float dist = _distance->distance(/* x = */ query, /* y = */ getNodeData(entry_node),
                                      /* asymmetric = */ true);
+    FN_PHASE_END(Initialize);
 
     float max_dist = dist;
     candidates.emplace_back(-dist, entry_node);
@@ -898,13 +932,16 @@ class Index {
     visited_set->insert(entry_node);
 
     while (!candidates.empty()) {
+      FN_PHASE_BEGIN(Select);
       auto [distance, node] = candidates.front();
 
       if (-distance > max_dist && neighbors.size() >= buffer_size) {
+        FN_PHASE_END(Select);
         break;
       }
       std::pop_heap(candidates.begin(), candidates.end(), cmp);
       candidates.pop_back();
+      FN_PHASE_END(Select);
 
       // Prefetching the next candidate node data and visited set marker
       // before processing it. Note that this might not be useful if the current
@@ -919,11 +956,13 @@ class Index {
       }
 #endif
 
+      FN_PHASE_BEGIN(Node);
       processCandidateNode(
           /* query = */ query, /* node = */ node,
           /* max_dist = */ max_dist, /* buffer_size = */ buffer_size,
           /* visited_set = */ visited_set,
           /* neighbors = */ neighbors, /* candidates = */ candidates);
+      FN_PHASE_END(Node);
     }
 
     _visited_set_pool->pushVisitedSet(
@@ -956,14 +995,23 @@ class Index {
         continue;
       }
       visited_set->insert(/* num = */ neighbor_node_id);
+
+      // Dereference data to ensure it's loaded into cache before timing Dist phase
+      // volatile float* neighbor_data_ptr = (float*)getNodeData(neighbor_node_id);
+      // volatile float ignored_val = neighbor_data_ptr[0];
+      // (void)ignored_val;  // Suppress unused warning
+
+      FN_PHASE_BEGIN(Dist);
       float dist = _distance->distance(/* x = */ query,
                                  /* y = */ getNodeData(neighbor_node_id),
                                  /* asymmetric = */ true);
+      FN_PHASE_END(Dist);
 
       if (_collect_stats) {
         _distance_computations.fetch_add(1);
       }
 
+      FN_PHASE_BEGIN(CI);
       if (neighbors.size() < buffer_size || dist < max_dist) {
         candidates.emplace_back(-dist, neighbor_node_id);
         std::push_heap(candidates.begin(), candidates.end(), cmp);
@@ -978,6 +1026,7 @@ class Index {
           max_dist = neighbors.top().first;
         }
       }
+      FN_PHASE_END(CI);
     }
   }
 
@@ -1123,6 +1172,8 @@ class Index {
       throw std::invalid_argument("num_initializations must be greater than 0.");
     }
 
+    FN_PHASE_BEGIN(Initialize);
+
     int step_size = _cur_num_nodes / num_initializations;
     step_size = step_size ? step_size : 1;
 
@@ -1147,6 +1198,8 @@ class Index {
         entry_node = node;
       }
     }
+
+    FN_PHASE_END(Initialize);
     return {entry_node, min_dist};
   }
 
