@@ -543,9 +543,9 @@ class Index {
   void seedBeamSearchState(Qstate& s, const std::pair<node_id_t, float>& entry, size_t buffer_size) {
     auto [entry_node, entry_dist] = entry;
 
-    s.visited.clear();
-    s.visited.reserve(2 * buffer_size); // heuristic to reduce rehashing
-    s.visited.insert(entry_node);
+    s.visited = _visited_set_pool->pollAvailableSet();
+    s.visited->clear();  // Clear stale entries from previous query
+    s.visited->insert(entry_node);
 
     s.max_dist = entry_dist;
 
@@ -646,6 +646,8 @@ class Index {
     slot_query_idx = next_query;
     next_query++;
 
+    _visited_set_pool->pushVisitedSet(
+        /* visited_set = */ s.visited);
     s.query = static_cast<const char*>(queries) + slot_query_idx * _data_size_bytes;
     FN_PHASE_BEGIN(Initialize);
     auto init_result = initializeSearch(s.query, num_initializations);
@@ -663,11 +665,12 @@ class Index {
 #ifdef USE_SSE
     if (s.link_idx < _M) {
       _mm_prefetch(getNodeData(s.current_links[s.link_idx]), _MM_HINT_T0);
+      s.visited->prefetch(s.current_links[s.link_idx]);
     }
 #endif
 
-      if(s.visited.count(neighbor_id) > 0) continue;
-      s.visited.insert(neighbor_id);
+      if(s.visited->isVisited(neighbor_id)) continue;
+      s.visited->insert(neighbor_id);
 
       FN_PHASE_BEGIN(Dist);
       float dist = _distance->distance(s.query, getNodeData(neighbor_id), true);

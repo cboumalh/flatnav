@@ -3,8 +3,10 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
-#include <unordered_set>
+#include <flatnav/util/VisitedSetPool.h>
 #include <vector>
+
+using flatnav::util::VisitedSet;
 
 namespace flatnav {
 
@@ -22,7 +24,7 @@ struct QueryState {
     size_t buffer_size;
     std::vector<DistNode> neighbors;
     std::vector<DistNode> candidates;
-    std::unordered_set<node_id_t> visited;
+    VisitedSet* visited;
     QueryExecutionState execution_state;
     float max_dist;
     node_id_t* current_links;
@@ -41,7 +43,7 @@ struct QueryState {
       }
       neighbors.clear();
       candidates.clear();
-      visited.clear();
+      visited->clear();
       execution_state = QueryExecutionState::Unscheduled;
       max_dist = std::numeric_limits<float>::max();
       current_links = nullptr;
