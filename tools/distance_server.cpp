@@ -65,7 +65,7 @@ public:
     loadVectorData(_config.data_file_path);
 
     // Create the IPC shared memory region with one slot per thread.
-    _ipc_server = std::make_unique<IpcServer>(
+    _ipc_server = std::make_unique<CxlServer>(
         _config.shm_name, static_cast<uint32_t>(_config.thread_count),
         static_cast<uint32_t>(_dimension));
     _ipc_server->create();
@@ -424,7 +424,7 @@ private:
   // Member data
   // --------------------------------------------------------------------------
   ServerConfig _config;
-  std::unique_ptr<IpcServer> _ipc_server;
+  std::unique_ptr<CxlServer> _ipc_server;
 
   // Vector storage (read-only after load).
   float *_vectors;
