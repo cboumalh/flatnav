@@ -7,6 +7,7 @@
 #include <flatnav/util/Reordering.h>
 #include <flatnav/util/VisitedSetPool.h>
 #include <flatnav/util/Datatype.h>
+#include <flatnav/util/SharedMemoryIpc.h>
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -79,6 +80,11 @@ class Index {
 
   bool _collect_stats = false;
   DataType _data_type;
+
+#ifdef FLATNAV_CXL_OFFLOAD
+  std::unique_ptr<flatnav::util::IpcClient> _ipc_client;
+  std::atomic<uint64_t> _cxl_query_id_counter{0};
+#endif
 
   // NOTE: These metrics are meaningful the most with single-threaded search.
   // With multi-threaded search, for instance, the number of distance computations will 
@@ -185,6 +191,36 @@ class Index {
     delete[] _index_memory;
     delete _visited_set_pool;
   }
+
+#ifdef FLATNAV_CXL_OFFLOAD
+  void connectToDistanceServer(const std::string &shm_name, uint32_t slot_id = 0) {
+    _ipc_client = std::make_unique<flatnav::util::IpcClient>(shm_name, slot_id);
+    if (!_ipc_client->connect()) {
+      throw std::runtime_error("Failed to connect to distance server at '" + shm_name + "'");
+    }
+  }
+
+  void disconnectFromDistanceServer() {
+    if (_ipc_client) {
+      _ipc_client->sendShutdown();
+      _ipc_client->disconnect();
+      _ipc_client.reset();
+    }
+  }
+
+private:
+  static inline thread_local uint64_t _cxl_active_query_id = 0;
+
+  float computeDistanceCxl(uint32_t node_id) {
+    float result = 0.0f;
+    if (!_ipc_client->computeDistances(_cxl_active_query_id, &node_id, 1, &result)) {
+      throw std::runtime_error("CXL distance computation failed for node " + std::to_string(node_id));
+    }
+    return result;
+  }
+
+public:
+#endif
 
 
   void buildGraphLinks(const std::string& mtx_filename) {
@@ -389,6 +425,13 @@ class Index {
    */
   std::vector<dist_label_t> search(const void* query, const int K, int ef_search,
                                    int num_initializations = 100) {
+#ifdef FLATNAV_CXL_OFFLOAD
+    uint64_t my_query_id = _cxl_query_id_counter.fetch_add(1);
+    _cxl_active_query_id = my_query_id;
+    _ipc_client->cacheQuery(my_query_id,
+                            static_cast<const float *>(query), _distance->dimension());
+#endif
+
     auto [entry_node, _init_dist] = initializeSearch(query, num_initializations);
     PriorityQueue neighbors = beamSearch(/* query = */ query,
                                          /* entry_node = */ entry_node,
@@ -411,6 +454,9 @@ class Index {
 
     flatnav::profiling::reset();
 
+#ifdef FLATNAV_CXL_OFFLOAD
+    _ipc_client->evictQuery(my_query_id);
+#endif
 
     return results;
   }
@@ -510,8 +556,12 @@ class Index {
         auto &is = init_states[q];
         if(is.done) continue;
 
+#ifdef FLATNAV_CXL_OFFLOAD
+        float dist = computeDistanceCxl(is.current_node);
+#else
         float dist = _distance->distance(states[q].query,
           getNodeData(is.current_node), true);
+#endif
 
         if (dist < is.min_dist) {
           is.min_dist = dist;
@@ -673,7 +723,11 @@ class Index {
       s.visited->insert(neighbor_id);
 
       FN_PHASE_BEGIN(Dist);
+#ifdef FLATNAV_CXL_OFFLOAD
+      float dist = computeDistanceCxl(neighbor_id);
+#else
       float dist = _distance->distance(s.query, getNodeData(neighbor_id), true);
+#endif
       FN_PHASE_END(Dist);
       if (_collect_stats) {
         _distance_computations.fetch_add(1);
@@ -924,8 +978,12 @@ class Index {
     // (void)ignored_val;  // Suppress unused warning
     
     FN_PHASE_BEGIN(Initialize);
+#ifdef FLATNAV_CXL_OFFLOAD
+    float dist = computeDistanceCxl(entry_node);
+#else
     float dist = _distance->distance(/* x = */ query, /* y = */ getNodeData(entry_node),
                                      /* asymmetric = */ true);
+#endif
     FN_PHASE_END(Initialize);
 
     float max_dist = dist;
@@ -1005,9 +1063,13 @@ class Index {
       // (void)ignored_val;  // Suppress unused warning
 
       FN_PHASE_BEGIN(Dist);
+#ifdef FLATNAV_CXL_OFFLOAD
+      float dist = computeDistanceCxl(neighbor_node_id);
+#else
       float dist = _distance->distance(/* x = */ query,
                                  /* y = */ getNodeData(neighbor_node_id),
                                  /* asymmetric = */ true);
+#endif
       FN_PHASE_END(Dist);
 
       if (_collect_stats) {
@@ -1194,8 +1256,12 @@ class Index {
         _mm_prefetch(getNodeData(next_node), _MM_HINT_T0);
       }
 #endif
+#ifdef FLATNAV_CXL_OFFLOAD
+      float dist = computeDistanceCxl(node);
+#else
       float dist = _distance->distance(/* x = */ query, /* y = */ getNodeData(node),
                                        /* asymmetric = */ true);
+#endif
       if (dist < min_dist) {
         min_dist = dist;
         entry_node = node;
