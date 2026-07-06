@@ -17,7 +17,7 @@ namespace flatnav::util {
 
 
 /**** ENUMS ****/
-enum class IpcMessageType : uint8_t {
+enum class CxlMessageType : uint8_t {
   CacheQuery = 1,
   EvictQuery = 2,
   DistanceRequest = 3,
@@ -32,28 +32,28 @@ enum class IpcMessageType : uint8_t {
 
 /**** MEMORY STRUCTS ****/
 
-struct IpcRequestHeader {
+struct CxlRequest {
   std::atomic<uint32_t> ready_flag;
-  IpcMessageType type;
+  CxlMessageType type;
   uint64_t query_id;
   uint32_t num_node_ids;
   uint32_t payload_size;
 };
 
-struct IpcResponseHeader {
+struct CxlResponse {
   std::atomic<uint32_t> ready_flag;
-  IpcMessageType type;
+  CxlMessageType type;
   uint32_t num_distances;
   uint32_t error_code;
 };
 
-struct IpcSlot {
+struct Slot {
   static constexpr size_t REQUEST_BUFFER_SIZE =
-      sizeof(IpcRequestHeader) + (1024 * sizeof(uint32_t)) +
+      sizeof(CxlRequest) + (1024 * sizeof(uint32_t)) +
       (2048 * sizeof(float)); // max 1024 node ids, max 2048-dim vectors
 
   static constexpr size_t RESPONSE_BUFFER_SIZE =
-      sizeof(IpcResponseHeader) + (1024 * sizeof(float)) + 256;
+      sizeof(CxlResponse) + (1024 * sizeof(float)) + 256;
 
   alignas(64) char request_buffer[REQUEST_BUFFER_SIZE];
   alignas(64) char response_buffer[RESPONSE_BUFFER_SIZE];
@@ -64,36 +64,36 @@ struct IpcSharedRegion {
   uint32_t dimension;
   std::atomic<uint32_t> server_ready;
   std::atomic<uint32_t> shutdown_flag;
-  IpcSlot slots[];
+  Slot slots[];
 };
 
 
 /**** IPC SERVER ****/
-class IpcServer {
+class CxlServer {
 public:
-  IpcServer(const std::string &shm_name, uint32_t num_slots, uint32_t dimension)
+  CxlServer(const std::string &shm_name, uint32_t num_slots, uint32_t dimension)
       : _shm_name(shm_name), _num_slots(num_slots), _dimension(dimension),
         _region(nullptr), _shm_fd(-1), _total_size(0) {}
 
-  ~IpcServer() {
+  ~CxlServer() {
     if (_region != nullptr) {
       destroy();
     }
   }
 
   void create() {
-    _total_size = sizeof(IpcSharedRegion) + _num_slots * sizeof(IpcSlot);
+    _total_size = sizeof(IpcSharedRegion) + _num_slots * sizeof(Slot);
 
     _shm_fd = shm_open(_shm_name.c_str(), O_CREAT | O_RDWR, 0666);
     if (_shm_fd == -1) {
-      throw std::runtime_error("IpcServer::create: shm_open failed for '" +
+      throw std::runtime_error("CxlServer::create: shm_open failed for '" +
                                _shm_name + "': " + std::strerror(errno));
     }
 
     if (ftruncate(_shm_fd, static_cast<off_t>(_total_size)) == -1) {
       close(_shm_fd);
       shm_unlink(_shm_name.c_str());
-      throw std::runtime_error("IpcServer::create: ftruncate failed: " +
+      throw std::runtime_error("CxlServer::create: ftruncate failed: " +
                                std::string(std::strerror(errno)));
     }
 
@@ -102,7 +102,7 @@ public:
     if (mapped == MAP_FAILED) {
       close(_shm_fd);
       shm_unlink(_shm_name.c_str());
-      throw std::runtime_error("IpcServer::create: mmap failed: " +
+      throw std::runtime_error("CxlServer::create: mmap failed: " +
                                std::string(std::strerror(errno)));
     }
 
@@ -125,14 +125,14 @@ public:
     shm_unlink(_shm_name.c_str());
   }
 
-  bool pollRequest(uint32_t slot_id, IpcRequestHeader &header, void *payload) {
+  bool pollRequest(uint32_t slot_id, CxlRequest &header, void *payload) {
     if (slot_id >= _num_slots || _region == nullptr) {
       return false;
     }
 
-    IpcSlot &slot = _region->slots[slot_id];
-    IpcRequestHeader *req_header =
-        reinterpret_cast<IpcRequestHeader *>(slot.request_buffer);
+    Slot &slot = _region->slots[slot_id];
+    CxlRequest *req_header =
+        reinterpret_cast<CxlRequest *>(slot.request_buffer);
 
     if (req_header->ready_flag.load(std::memory_order_acquire) != 1) {
       return false;
@@ -145,7 +145,7 @@ public:
 
     if (payload != nullptr && header.payload_size > 0) {
       const char *payload_src =
-          slot.request_buffer + sizeof(IpcRequestHeader);
+          slot.request_buffer + sizeof(CxlRequest);
       std::memcpy(payload, payload_src, header.payload_size);
     }
 
@@ -154,15 +154,15 @@ public:
     return true;
   }
 
-  void sendResponse(uint32_t slot_id, const IpcResponseHeader &header,
+  void sendResponse(uint32_t slot_id, const CxlResponse &header,
                     const void *payload) {
     if (slot_id >= _num_slots || _region == nullptr) {
       return;
     }
 
-    IpcSlot &slot = _region->slots[slot_id];
-    IpcResponseHeader *resp_header =
-        reinterpret_cast<IpcResponseHeader *>(slot.response_buffer);
+    Slot &slot = _region->slots[slot_id];
+    CxlResponse *resp_header =
+        reinterpret_cast<CxlResponse *>(slot.response_buffer);
 
     resp_header->type = header.type;
     resp_header->num_distances = header.num_distances;
@@ -170,16 +170,16 @@ public:
 
     if (payload != nullptr) {
       size_t payload_size = 0;
-      if (header.type == IpcMessageType::DistanceResponse) {
+      if (header.type == CxlMessageType::DistanceResponse) {
         payload_size = header.num_distances * sizeof(float);
-      } else if (header.type == IpcMessageType::ErrorResponse) {
+      } else if (header.type == CxlMessageType::ErrorResponse) {
         payload_size = header.num_distances;
-      } else if (header.type == IpcMessageType::StatsResponse) {
+      } else if (header.type == CxlMessageType::StatsResponse) {
         payload_size = 4 * sizeof(uint64_t);
       }
 
       if (payload_size > 0) {
-        char *payload_dst = slot.response_buffer + sizeof(IpcResponseHeader);
+        char *payload_dst = slot.response_buffer + sizeof(CxlResponse);
         std::memcpy(payload_dst, payload, payload_size);
       }
     }
@@ -215,13 +215,13 @@ private:
 
 
 /**** IPC Client ****/
-class IpcClient {
+class CxlClient {
 public:
-  IpcClient(const std::string &shm_name, uint32_t slot_id)
+  CxlClient(const std::string &shm_name, uint32_t slot_id)
       : _shm_name(shm_name), _slot_id(slot_id), _region(nullptr),
         _shm_fd(-1), _mapped_size(0), _connected(false) {}
 
-  ~IpcClient() {
+  ~CxlClient() {
     if (_connected) {
       disconnect();
     }
@@ -302,22 +302,22 @@ public:
       return false;
     }
 
-    IpcSlot &slot = _region->slots[_slot_id];
-    IpcRequestHeader *req_header =
-        reinterpret_cast<IpcRequestHeader *>(slot.request_buffer);
+    Slot &slot = _region->slots[_slot_id];
+    CxlRequest *req_header =
+        reinterpret_cast<CxlRequest *>(slot.request_buffer);
 
     uint32_t payload_size = static_cast<uint32_t>(dimension * sizeof(float));
-    char *payload_dst = slot.request_buffer + sizeof(IpcRequestHeader);
+    char *payload_dst = slot.request_buffer + sizeof(CxlRequest);
     std::memcpy(payload_dst, vector, payload_size);
 
-    req_header->type = IpcMessageType::CacheQuery;
+    req_header->type = CxlMessageType::CacheQuery;
     req_header->query_id = query_id;
     req_header->num_node_ids = 0;
     req_header->payload_size = payload_size;
 
     req_header->ready_flag.store(1, std::memory_order_release);
 
-    return waitForResponse(IpcMessageType::Ack);
+    return waitForResponse(CxlMessageType::Ack);
   }
 
   bool evictQuery(uint64_t query_id) {
@@ -325,18 +325,18 @@ public:
       return false;
     }
 
-    IpcSlot &slot = _region->slots[_slot_id];
-    IpcRequestHeader *req_header =
-        reinterpret_cast<IpcRequestHeader *>(slot.request_buffer);
+    Slot &slot = _region->slots[_slot_id];
+    CxlRequest *req_header =
+        reinterpret_cast<CxlRequest *>(slot.request_buffer);
 
-    req_header->type = IpcMessageType::EvictQuery;
+    req_header->type = CxlMessageType::EvictQuery;
     req_header->query_id = query_id;
     req_header->num_node_ids = 0;
     req_header->payload_size = 0;
 
     req_header->ready_flag.store(1, std::memory_order_release);
 
-    return waitForResponse(IpcMessageType::Ack);
+    return waitForResponse(CxlMessageType::Ack);
   }
 
   bool computeDistances(uint64_t query_id, const uint32_t *node_ids,
@@ -348,15 +348,15 @@ public:
       return false;
     }
 
-    IpcSlot &slot = _region->slots[_slot_id];
-    IpcRequestHeader *req_header =
-        reinterpret_cast<IpcRequestHeader *>(slot.request_buffer);
+    Slot &slot = _region->slots[_slot_id];
+    CxlRequest *req_header =
+        reinterpret_cast<CxlRequest *>(slot.request_buffer);
 
     uint32_t payload_size = count * sizeof(uint32_t);
-    char *payload_dst = slot.request_buffer + sizeof(IpcRequestHeader);
+    char *payload_dst = slot.request_buffer + sizeof(CxlRequest);
     std::memcpy(payload_dst, node_ids, payload_size);
 
-    req_header->type = IpcMessageType::DistanceRequest;
+    req_header->type = CxlMessageType::DistanceRequest;
     req_header->query_id = query_id;
     req_header->num_node_ids = count;
     req_header->payload_size = payload_size;
@@ -365,20 +365,20 @@ public:
 
     auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
-    IpcResponseHeader *resp_header =
-        reinterpret_cast<IpcResponseHeader *>(slot.response_buffer);
+    CxlResponse *resp_header =
+        reinterpret_cast<CxlResponse *>(slot.response_buffer);
 
     while (std::chrono::steady_clock::now() < deadline) {
       if (resp_header->ready_flag.load(std::memory_order_acquire) == 1) {
-        if (resp_header->type == IpcMessageType::ErrorResponse) {
+        if (resp_header->type == CxlMessageType::ErrorResponse) {
           resp_header->ready_flag.store(0, std::memory_order_release);
           return false;
         }
 
-        if (resp_header->type == IpcMessageType::DistanceResponse &&
+        if (resp_header->type == CxlMessageType::DistanceResponse &&
             resp_header->num_distances == count) {
           const char *payload_src =
-              slot.response_buffer + sizeof(IpcResponseHeader);
+              slot.response_buffer + sizeof(CxlResponse);
           std::memcpy(out_distances, payload_src, count * sizeof(float));
           resp_header->ready_flag.store(0, std::memory_order_release);
           return true;
@@ -398,11 +398,11 @@ public:
       return false;
     }
 
-    IpcSlot &slot = _region->slots[_slot_id];
-    IpcRequestHeader *req_header =
-        reinterpret_cast<IpcRequestHeader *>(slot.request_buffer);
+    Slot &slot = _region->slots[_slot_id];
+    CxlRequest *req_header =
+        reinterpret_cast<CxlRequest *>(slot.request_buffer);
 
-    req_header->type = IpcMessageType::Shutdown;
+    req_header->type = CxlMessageType::Shutdown;
     req_header->query_id = 0;
     req_header->num_node_ids = 0;
     req_header->payload_size = 0;
@@ -411,13 +411,13 @@ public:
 
     auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
-    IpcResponseHeader *resp_header =
-        reinterpret_cast<IpcResponseHeader *>(slot.response_buffer);
+    CxlResponse *resp_header =
+        reinterpret_cast<CxlResponse *>(slot.response_buffer);
 
     while (std::chrono::steady_clock::now() < deadline) {
       if (resp_header->ready_flag.load(std::memory_order_acquire) == 1) {
         resp_header->ready_flag.store(0, std::memory_order_release);
-        return (resp_header->type == IpcMessageType::Ack);
+        return (resp_header->type == CxlMessageType::Ack);
       }
       std::this_thread::yield();
     }
@@ -431,11 +431,11 @@ public:
       return false;
     }
 
-    IpcSlot &slot = _region->slots[_slot_id];
-    IpcRequestHeader *req_header =
-        reinterpret_cast<IpcRequestHeader *>(slot.request_buffer);
+    Slot &slot = _region->slots[_slot_id];
+    CxlRequest *req_header =
+        reinterpret_cast<CxlRequest *>(slot.request_buffer);
 
-    req_header->type = IpcMessageType::StatsRequest;
+    req_header->type = CxlMessageType::StatsRequest;
     req_header->query_id = 0;
     req_header->num_node_ids = 0;
     req_header->payload_size = 0;
@@ -444,14 +444,14 @@ public:
 
     auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
-    IpcResponseHeader *resp_header =
-        reinterpret_cast<IpcResponseHeader *>(slot.response_buffer);
+    CxlResponse *resp_header =
+        reinterpret_cast<CxlResponse *>(slot.response_buffer);
 
     while (std::chrono::steady_clock::now() < deadline) {
       if (resp_header->ready_flag.load(std::memory_order_acquire) == 1) {
-        if (resp_header->type == IpcMessageType::StatsResponse) {
+        if (resp_header->type == CxlMessageType::StatsResponse) {
           const uint64_t *stats_payload = reinterpret_cast<const uint64_t *>(
-              slot.response_buffer + sizeof(IpcResponseHeader));
+              slot.response_buffer + sizeof(CxlResponse));
           mean_ns = stats_payload[0];
           p50_ns = stats_payload[1];
           p99_ns = stats_payload[2];
@@ -473,30 +473,30 @@ public:
       return false;
     }
 
-    IpcSlot &slot = _region->slots[_slot_id];
-    IpcRequestHeader *req_header =
-        reinterpret_cast<IpcRequestHeader *>(slot.request_buffer);
+    Slot &slot = _region->slots[_slot_id];
+    CxlRequest *req_header =
+        reinterpret_cast<CxlRequest *>(slot.request_buffer);
 
-    req_header->type = IpcMessageType::StatsReset;
+    req_header->type = CxlMessageType::StatsReset;
     req_header->query_id = 0;
     req_header->num_node_ids = 0;
     req_header->payload_size = 0;
 
     req_header->ready_flag.store(1, std::memory_order_release);
 
-    return waitForResponse(IpcMessageType::Ack);
+    return waitForResponse(CxlMessageType::Ack);
   }
 
   bool isConnected() const { return _connected; }
 
 private:
-  bool waitForResponse(IpcMessageType expected_type) {
+  bool waitForResponse(CxlMessageType expected_type) {
     auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
 
-    IpcSlot &slot = _region->slots[_slot_id];
-    IpcResponseHeader *resp_header =
-        reinterpret_cast<IpcResponseHeader *>(slot.response_buffer);
+    Slot &slot = _region->slots[_slot_id];
+    CxlResponse *resp_header =
+        reinterpret_cast<CxlResponse *>(slot.response_buffer);
 
     while (std::chrono::steady_clock::now() < deadline) {
       if (resp_header->ready_flag.load(std::memory_order_acquire) == 1) {

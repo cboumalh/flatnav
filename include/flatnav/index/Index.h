@@ -7,7 +7,7 @@
 #include <flatnav/util/Reordering.h>
 #include <flatnav/util/VisitedSetPool.h>
 #include <flatnav/util/Datatype.h>
-#include <flatnav/util/SharedMemoryIpc.h>
+#include <flatnav/util/CxlSimulation.h>
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -82,7 +82,7 @@ class Index {
   DataType _data_type;
 
 #ifdef FLATNAV_CXL_OFFLOAD
-  std::unique_ptr<flatnav::util::IpcClient> _ipc_client;
+  std::unique_ptr<flatnav::util::CxlClient> _cxl_client;
   std::atomic<uint64_t> _cxl_query_id_counter{0};
 #endif
 
@@ -194,17 +194,17 @@ class Index {
 
 #ifdef FLATNAV_CXL_OFFLOAD
   void connectToDistanceServer(const std::string &shm_name, uint32_t slot_id = 0) {
-    _ipc_client = std::make_unique<flatnav::util::IpcClient>(shm_name, slot_id);
-    if (!_ipc_client->connect()) {
+    _cxl_client = std::make_unique<flatnav::util::CxlClient>(shm_name, slot_id);
+    if (!_cxl_client->connect()) {
       throw std::runtime_error("Failed to connect to distance server at '" + shm_name + "'");
     }
   }
 
   void disconnectFromDistanceServer() {
-    if (_ipc_client) {
-      _ipc_client->sendShutdown();
-      _ipc_client->disconnect();
-      _ipc_client.reset();
+    if (_cxl_client) {
+      _cxl_client->sendShutdown();
+      _cxl_client->disconnect();
+      _cxl_client.reset();
     }
   }
 
@@ -213,7 +213,7 @@ private:
 
   float computeDistanceCxl(uint32_t node_id) {
     float result = 0.0f;
-    if (!_ipc_client->computeDistances(_cxl_active_query_id, &node_id, 1, &result)) {
+    if (!_cxl_client->computeDistances(_cxl_active_query_id, &node_id, 1, &result)) {
       throw std::runtime_error("CXL distance computation failed for node " + std::to_string(node_id));
     }
     return result;
@@ -426,9 +426,9 @@ public:
   std::vector<dist_label_t> search(const void* query, const int K, int ef_search,
                                    int num_initializations = 100) {
 #ifdef FLATNAV_CXL_OFFLOAD
-    uint64_t my_query_id = _cxl_query_id_counter.fetch_add(1);
-    _cxl_active_query_id = my_query_id;
-    _ipc_client->cacheQuery(my_query_id,
+    uint64_t curr_query_id = _cxl_query_id_counter.fetch_add(1);
+    _cxl_active_query_id = curr_query_id;
+    _cxl_client->cacheQuery(curr_query_id,
                             static_cast<const float *>(query), _distance->dimension());
 #endif
 
@@ -455,7 +455,7 @@ public:
     flatnav::profiling::reset();
 
 #ifdef FLATNAV_CXL_OFFLOAD
-    _ipc_client->evictQuery(my_query_id);
+    _cxl_client->evictQuery(curr_query_id);
 #endif
 
     return results;
