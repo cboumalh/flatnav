@@ -2,7 +2,7 @@
 #include <flatnav/distances/IPDistanceDispatcher.h>
 #include <flatnav/distances/L2DistanceDispatcher.h>
 #include <flatnav/util/OffloadMetrics.h>
-#include <flatnav/util/SharedMemoryIpc.h>
+#include <flatnav/util/CxlSimulation.h>
 
 #include <algorithm>
 #include <atomic>
@@ -65,11 +65,11 @@ public:
     loadVectorData(_config.data_file_path);
 
     // Create the IPC shared memory region with one slot per thread.
-    _ipc_server = std::make_unique<CxlServer>(
+    _cxl_server = std::make_unique<CxlServer>(
         _config.shm_name, static_cast<uint32_t>(_config.thread_count),
         static_cast<uint32_t>(_dimension));
-    _ipc_server->create();
-    _ipc_server->setReady();
+    _cxl_server->create();
+    _cxl_server->setReady();
 
     std::cout << "READY: Distance Server listening on " << _config.shm_name
               << " with " << _config.thread_count << " threads, "
@@ -84,7 +84,7 @@ public:
 
     // Main loop: wait for shutdown signal.
     while (_running.load() && g_running.load() &&
-           !_ipc_server->isShutdownRequested()) {
+           !_cxl_server->isShutdownRequested()) {
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
@@ -114,9 +114,9 @@ public:
     _workers.clear();
 
     // Destroy the IPC region (unmaps + unlinks shared memory).
-    if (_ipc_server) {
-      _ipc_server->destroy();
-      _ipc_server.reset();
+    if (_cxl_server) {
+      _cxl_server->destroy();
+      _cxl_server.reset();
     }
   }
 
@@ -163,11 +163,11 @@ private:
   // --------------------------------------------------------------------------
   void workerLoop(uint32_t slot_id) {
     // Temporary buffer for incoming request payloads.
-    std::vector<char> payload_buf(IpcSlot::REQUEST_BUFFER_SIZE);
+    std::vector<char> payload_buf(Slot::REQUEST_BUFFER_SIZE);
 
     while (_running.load(std::memory_order_relaxed)) {
-      IpcRequestHeader header;
-      if (!_ipc_server->pollRequest(slot_id, header, payload_buf.data())) {
+      CxlRequest header;
+      if (!_cxl_server->pollRequest(slot_id, header, payload_buf.data())) {
         // No request available — brief pause to avoid busy-spin.
         std::this_thread::yield();
         continue;
@@ -195,25 +195,25 @@ private:
   // --------------------------------------------------------------------------
   // Request dispatch
   // --------------------------------------------------------------------------
-  void processRequest(uint32_t slot_id, const IpcRequestHeader &header,
+  void processRequest(uint32_t slot_id, const CxlRequest &header,
                       const void *payload) {
     switch (header.type) {
-    case IpcMessageType::CacheQuery:
+    case CxlMessageType::CacheQuery:
       handleCacheQuery(slot_id, header, payload);
       break;
-    case IpcMessageType::EvictQuery:
+    case CxlMessageType::EvictQuery:
       handleEvictQuery(slot_id, header);
       break;
-    case IpcMessageType::DistanceRequest:
+    case CxlMessageType::DistanceRequest:
       handleDistanceRequest(slot_id, header, payload);
       break;
-    case IpcMessageType::StatsRequest:
+    case CxlMessageType::StatsRequest:
       handleStatsRequest(slot_id);
       break;
-    case IpcMessageType::StatsReset:
+    case CxlMessageType::StatsReset:
       handleStatsReset(slot_id);
       break;
-    case IpcMessageType::Shutdown:
+    case CxlMessageType::Shutdown:
       handleShutdown(slot_id);
       break;
     default:
@@ -225,7 +225,7 @@ private:
   // --------------------------------------------------------------------------
   // CacheQuery: store query vector in cache
   // --------------------------------------------------------------------------
-  void handleCacheQuery(uint32_t slot_id, const IpcRequestHeader &header,
+  void handleCacheQuery(uint32_t slot_id, const CxlRequest &header,
                         const void *payload) {
     // Validate dimension.
     size_t expected_size = _dimension * sizeof(float);
@@ -243,34 +243,34 @@ private:
     }
 
     // Send Ack.
-    IpcResponseHeader resp{};
-    resp.type = IpcMessageType::Ack;
+    CxlResponse resp{};
+    resp.type = CxlMessageType::Ack;
     resp.num_distances = 0;
     resp.error_code = 0;
-    _ipc_server->sendResponse(slot_id, resp, nullptr);
+    _cxl_server->sendResponse(slot_id, resp, nullptr);
   }
 
   // --------------------------------------------------------------------------
   // EvictQuery: remove from cache (silent no-op if not present)
   // --------------------------------------------------------------------------
-  void handleEvictQuery(uint32_t slot_id, const IpcRequestHeader &header) {
+  void handleEvictQuery(uint32_t slot_id, const CxlRequest &header) {
     {
       std::unique_lock<std::shared_mutex> lock(_cache_mutex);
       _query_cache.erase(header.query_id);
     }
 
     // Send Ack.
-    IpcResponseHeader resp{};
-    resp.type = IpcMessageType::Ack;
+    CxlResponse resp{};
+    resp.type = CxlMessageType::Ack;
     resp.num_distances = 0;
     resp.error_code = 0;
-    _ipc_server->sendResponse(slot_id, resp, nullptr);
+    _cxl_server->sendResponse(slot_id, resp, nullptr);
   }
 
   // --------------------------------------------------------------------------
   // DistanceRequest: compute distances for a batch of node IDs
   // --------------------------------------------------------------------------
-  void handleDistanceRequest(uint32_t slot_id, const IpcRequestHeader &header,
+  void handleDistanceRequest(uint32_t slot_id, const CxlRequest &header,
                              const void *payload) {
     uint32_t count = header.num_node_ids;
 
@@ -310,11 +310,11 @@ private:
     }
 
     // Send DistanceResponse.
-    IpcResponseHeader resp{};
-    resp.type = IpcMessageType::DistanceResponse;
+    CxlResponse resp{};
+    resp.type = CxlMessageType::DistanceResponse;
     resp.num_distances = count;
     resp.error_code = 0;
-    _ipc_server->sendResponse(slot_id, resp, distances.data());
+    _cxl_server->sendResponse(slot_id, resp, distances.data());
   }
 
   // --------------------------------------------------------------------------
@@ -362,11 +362,11 @@ private:
     }
 
     // Send StatsResponse.
-    IpcResponseHeader resp{};
-    resp.type = IpcMessageType::StatsResponse;
+    CxlResponse resp{};
+    resp.type = CxlMessageType::StatsResponse;
     resp.num_distances = 0;
     resp.error_code = 0;
-    _ipc_server->sendResponse(slot_id, resp, &stats);
+    _cxl_server->sendResponse(slot_id, resp, &stats);
   }
 
   // --------------------------------------------------------------------------
@@ -379,11 +379,11 @@ private:
       _metrics.total_requests.store(0);
     }
 
-    IpcResponseHeader resp{};
-    resp.type = IpcMessageType::Ack;
+    CxlResponse resp{};
+    resp.type = CxlMessageType::Ack;
     resp.num_distances = 0;
     resp.error_code = 0;
-    _ipc_server->sendResponse(slot_id, resp, nullptr);
+    _cxl_server->sendResponse(slot_id, resp, nullptr);
   }
 
   // --------------------------------------------------------------------------
@@ -391,11 +391,11 @@ private:
   // --------------------------------------------------------------------------
   void handleShutdown(uint32_t slot_id) {
     // Ack the shutdown request.
-    IpcResponseHeader resp{};
-    resp.type = IpcMessageType::Ack;
+    CxlResponse resp{};
+    resp.type = CxlMessageType::Ack;
     resp.num_distances = 0;
     resp.error_code = 0;
-    _ipc_server->sendResponse(slot_id, resp, nullptr);
+    _cxl_server->sendResponse(slot_id, resp, nullptr);
 
     // Signal main loop to stop.
     _running.store(false);
@@ -406,8 +406,8 @@ private:
   // --------------------------------------------------------------------------
   void sendError(uint32_t slot_id, uint32_t error_code,
                  const char *message) {
-    IpcResponseHeader resp{};
-    resp.type = IpcMessageType::ErrorResponse;
+    CxlResponse resp{};
+    resp.type = CxlMessageType::ErrorResponse;
     resp.error_code = error_code;
 
     size_t msg_len = std::strlen(message);
@@ -417,14 +417,14 @@ private:
     // Reuse num_distances as payload size for error messages.
     resp.num_distances = static_cast<uint32_t>(msg_len);
 
-    _ipc_server->sendResponse(slot_id, resp, message);
+    _cxl_server->sendResponse(slot_id, resp, message);
   }
 
   // --------------------------------------------------------------------------
   // Member data
   // --------------------------------------------------------------------------
   ServerConfig _config;
-  std::unique_ptr<CxlServer> _ipc_server;
+  std::unique_ptr<CxlServer> _cxl_server;
 
   // Vector storage (read-only after load).
   float *_vectors;
