@@ -15,6 +15,8 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <numa.h>
+#include <sched.h>
 #include <shared_mutex>
 #include <signal.h>
 #include <string>
@@ -567,10 +569,64 @@ static ServerConfig parseArgs(int argc, char *argv[]) {
 }
 
 // ----------------------------------------------------------------------------
+// NUMA binding — pins the entire process (CPU + memory) to the given node.
+// ----------------------------------------------------------------------------
+static void bindToNumaNode(int node) {
+  if (numa_available() < 0) {
+    std::cerr << "Warning: NUMA is not available on this system. "
+              << "Ignoring --numa-node." << std::endl;
+    return;
+  }
+
+  int max_node = numa_max_node();
+  if (node < 0 || node > max_node) {
+    std::cerr << "Error: NUMA node " << node << " is invalid. "
+              << "Available nodes: 0-" << max_node << std::endl;
+    std::exit(1);
+  }
+
+  // Bind memory allocations to this NUMA node.
+  struct bitmask *nodemask = numa_allocate_nodemask();
+  numa_bitmask_setbit(nodemask, node);
+  numa_set_membind(nodemask);
+  numa_free_nodemask(nodemask);
+
+  // Pin all threads (current + future) to CPUs on this NUMA node.
+  struct bitmask *cpumask = numa_allocate_cpumask();
+  if (numa_node_to_cpus(node, cpumask) < 0) {
+    std::cerr << "Error: Failed to get CPUs for NUMA node " << node
+              << std::endl;
+    numa_free_cpumask(cpumask);
+    std::exit(1);
+  }
+
+  // Convert numa bitmask to cpu_set_t for sched_setaffinity.
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  for (unsigned int cpu = 0; cpu < numa_num_possible_cpus(); cpu++) {
+    if (numa_bitmask_isbitset(cpumask, cpu)) {
+      CPU_SET(cpu, &cpuset);
+    }
+  }
+  numa_free_cpumask(cpumask);
+
+  if (sched_setaffinity(0, sizeof(cpuset), &cpuset) != 0) {
+    std::cerr << "Error: sched_setaffinity failed: " << strerror(errno)
+              << std::endl;
+    std::exit(1);
+  }
+
+  std::cout << "[NUMA] Process bound to node " << node << std::endl;
+}
+
+// ----------------------------------------------------------------------------
 // Main
 // ----------------------------------------------------------------------------
 int main(int argc, char *argv[]) {
   ServerConfig config = parseArgs(argc, argv);
+
+  // Bind entire process to the specified NUMA node BEFORE any allocations.
+  bindToNumaNode(config.numa_node);
 
   // Install SIGTERM handler (async-signal-safe: only sets atomic flag).
   struct sigaction sa {};

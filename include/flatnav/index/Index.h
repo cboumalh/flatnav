@@ -190,6 +190,10 @@ class Index {
     _graph_node_size_bytes = (sizeof(node_id_t) * _M) + sizeof(label_t);
     uint64_t index_size = static_cast<uint64_t>(_node_size_bytes) * static_cast<uint64_t>(_max_node_count);
     _index_memory = new char[index_size];
+
+#ifdef FLATNAV_CXL_OFFLOAD
+    connectToDistanceServer("/flatnav_cxl");
+#endif
   }
 
   ~Index() {
