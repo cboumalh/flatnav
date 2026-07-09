@@ -3,14 +3,13 @@
 #include <flatnav/distances/IPDistanceDispatcher.h>
 #include <flatnav/distances/L2DistanceDispatcher.h>
 #include <flatnav/distances/SquaredL2Distance.h>
+#include <flatnav/index/Index.h>
 #include <flatnav/util/Datatype.h>
 #include <flatnav/util/OffloadMetrics.h>
 #include <flatnav/util/CxlSimulation.h>
 
 #include <algorithm>
 #include <atomic>
-#include <cereal/archives/binary.hpp>
-#include <cereal/cereal.hpp>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -127,75 +126,69 @@ public:
 
 private:
   // --------------------------------------------------------------------------
-  // Vector data loading — reads directly from a serialized flatnav index file
-  // using the same binary format as Index::loadIndex.
+  // Vector data loading — loads a serialized flatnav index and extracts the
+  // vector data, mirroring how buildGraphLinks operates on a loaded Index.
   // --------------------------------------------------------------------------
   void loadVectorData(const std::string &path) {
-    std::ifstream stream(path, std::ios::binary);
-    if (!stream.is_open()) {
-      std::cerr << "Error: Cannot open index file '" << path << "'"
-                << std::endl;
-      std::exit(1);
-    }
+    std::cout << "[loadVectorData] Loading index from: " << path << std::endl;
 
-    cereal::BinaryInputArchive archive(stream);
-
-    // 1. Deserialize index metadata (mirrors Index::loadIndex).
-    flatnav::util::DataType data_type;
-    size_t M = 0;
-    size_t data_size_bytes = 0;
-    size_t node_size_bytes = 0;
-    size_t max_node_count = 0;
-    size_t cur_num_nodes = 0;
-
-    // Deserialize the distance object to advance the archive past it.
-    // Both SquaredL2Distance and InnerProductDistance serialize (dimension,
-    // data_size_bytes). We use the metric config to pick the right type.
-    std::cout << "[loadVectorData] Deserializing metadata..." << std::endl;
+    // Use Index::loadIndex to deserialize the full index (same as
+    // buildGraphLinks operates on an already-loaded index).
+    using L2Index = flatnav::Index<
+        flatnav::distances::SquaredL2Distance<>,
+        uint32_t>;
+    using IPIndex = flatnav::Index<
+        flatnav::distances::InnerProductDistance<>,
+        uint32_t>;
 
     if (_config.metric == MetricType::L2) {
-      flatnav::distances::SquaredL2Distance<> dist;
-      archive(data_type, M, data_size_bytes, node_size_bytes, max_node_count,
-              cur_num_nodes, dist);
-      _dimension = dist.getDimension();
+      auto index = L2Index::loadIndex(path);
+
+      _num_vectors = index->currentNumNodes();
+      _dimension = index->dataDimension();
+      size_t data_size_bytes = index->dataSizeBytes();
+      size_t node_size_bytes = index->nodeSizeBytes();
+
+      std::cout << "[loadVectorData] Index metadata:" << std::endl;
+      std::cout << "  M (edges/node)   = " << index->maxEdgesPerNode() << std::endl;
+      std::cout << "  data_size_bytes  = " << data_size_bytes << std::endl;
+      std::cout << "  node_size_bytes  = " << node_size_bytes << std::endl;
+      std::cout << "  max_node_count   = " << index->maxNodeCount() << std::endl;
+      std::cout << "  cur_num_nodes    = " << _num_vectors << std::endl;
+      std::cout << "  dimension        = " << _dimension << std::endl;
+
+      // Extract vector data from each node into a contiguous float array.
+      size_t total_floats = _num_vectors * _dimension;
+      _vectors = new float[total_floats];
+
+      for (size_t i = 0; i < _num_vectors; i++) {
+        const char *node_data = index->getNodeDataPublic(static_cast<uint32_t>(i));
+        std::memcpy(_vectors + (i * _dimension), node_data, data_size_bytes);
+      }
     } else {
-      flatnav::distances::InnerProductDistance<> dist;
-      archive(data_type, M, data_size_bytes, node_size_bytes, max_node_count,
-              cur_num_nodes, dist);
-      _dimension = dist.getDimension();
-    }
+      auto index = IPIndex::loadIndex(path);
 
-    _num_vectors = cur_num_nodes;
+      _num_vectors = index->currentNumNodes();
+      _dimension = index->dataDimension();
+      size_t data_size_bytes = index->dataSizeBytes();
+      size_t node_size_bytes = index->nodeSizeBytes();
 
-    std::cout << "[loadVectorData] Index metadata:" << std::endl;
-    std::cout << "  data_type        = " << static_cast<int>(data_type) << std::endl;
-    std::cout << "  M (edges/node)   = " << M << std::endl;
-    std::cout << "  data_size_bytes  = " << data_size_bytes << std::endl;
-    std::cout << "  node_size_bytes  = " << node_size_bytes << std::endl;
-    std::cout << "  max_node_count   = " << max_node_count << std::endl;
-    std::cout << "  cur_num_nodes    = " << cur_num_nodes << std::endl;
-    std::cout << "  dimension        = " << _dimension << std::endl;
+      std::cout << "[loadVectorData] Index metadata:" << std::endl;
+      std::cout << "  M (edges/node)   = " << index->maxEdgesPerNode() << std::endl;
+      std::cout << "  data_size_bytes  = " << data_size_bytes << std::endl;
+      std::cout << "  node_size_bytes  = " << node_size_bytes << std::endl;
+      std::cout << "  max_node_count   = " << index->maxNodeCount() << std::endl;
+      std::cout << "  cur_num_nodes    = " << _num_vectors << std::endl;
+      std::cout << "  dimension        = " << _dimension << std::endl;
 
-    // 2. Read the interleaved index memory and extract vector data.
-    //    Node layout: [vector_data (data_size_bytes)] [M links] [label]
-    uint64_t total_mem =
-        static_cast<uint64_t>(node_size_bytes) * static_cast<uint64_t>(max_node_count);
-    std::cout << "[loadVectorData] Allocating " << total_mem
-              << " bytes for index memory..." << std::endl;
-    std::vector<char> index_memory(total_mem);
-    archive(cereal::binary_data(index_memory.data(), total_mem));
-    std::cout << "[loadVectorData] Deserialized index memory block." << std::endl;
+      // Extract vector data from each node into a contiguous float array.
+      size_t total_floats = _num_vectors * _dimension;
+      _vectors = new float[total_floats];
 
-    // 3. Copy out just the vector portions into a contiguous float array.
-    size_t total_floats = _num_vectors * _dimension;
-    _vectors = new float[total_floats];
-
-    std::cout << "[loadVectorData] Extracting " << _num_vectors
-              << " vectors from interleaved nodes..." << std::endl;
-
-    for (size_t i = 0; i < _num_vectors; i++) {
-      const char *node_start = index_memory.data() + (i * node_size_bytes);
-      std::memcpy(_vectors + (i * _dimension), node_start, data_size_bytes);
+      for (size_t i = 0; i < _num_vectors; i++) {
+        const char *node_data = index->getNodeDataPublic(static_cast<uint32_t>(i));
+        std::memcpy(_vectors + (i * _dimension), node_data, data_size_bytes);
+      }
     }
 
     // Sanity check: print first vector's first few values.
@@ -211,8 +204,7 @@ private:
     }
 
     std::cout << "[loadVectorData] Done. Loaded " << _num_vectors
-              << " vectors (dim=" << _dimension << ") from index file: " << path
-              << std::endl;
+              << " vectors (dim=" << _dimension << ")" << std::endl;
   }
 
   // --------------------------------------------------------------------------

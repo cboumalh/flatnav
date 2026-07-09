@@ -880,6 +880,12 @@ public:
   inline size_t currentNumNodes() const { return _cur_num_nodes; }
   inline size_t dataDimension() const { return _distance->dimension(); }
 
+  /// Returns a pointer to the raw vector data for node `n`.
+  inline const char* getNodeDataPublic(uint32_t n) const {
+    uint64_t byte_offset = static_cast<uint64_t>(n) * static_cast<uint64_t>(_node_size_bytes);
+    return _index_memory + byte_offset;
+  }
+
   inline uint64_t distanceComputations() const { return _distance_computations.load(); }
 
   inline DataType getDataType() const { return _data_type; }
