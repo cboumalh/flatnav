@@ -1,10 +1,6 @@
 #include <flatnav/distances/DistanceInterface.h>
-#include <flatnav/distances/InnerProductDistance.h>
 #include <flatnav/distances/IPDistanceDispatcher.h>
 #include <flatnav/distances/L2DistanceDispatcher.h>
-#include <flatnav/distances/SquaredL2Distance.h>
-#include <flatnav/index/Index.h>
-#include <flatnav/util/Datatype.h>
 #include <flatnav/util/OffloadMetrics.h>
 #include <flatnav/util/CxlSimulation.h>
 
@@ -126,69 +122,72 @@ public:
 
 private:
   // --------------------------------------------------------------------------
-  // Vector data loading — loads a serialized flatnav index and extracts the
-  // vector data, mirroring how buildGraphLinks operates on a loaded Index.
+  // Vector data loading — reads a .fvecs file (standard ANN benchmark format).
+  // Format: each vector is stored as [int32 dim][dim × float32 values].
   // --------------------------------------------------------------------------
   void loadVectorData(const std::string &path) {
-    std::cout << "[loadVectorData] Loading index from: " << path << std::endl;
+    std::cout << "[loadVectorData] Loading vectors from: " << path << std::endl;
 
-    // Use Index::loadIndex to deserialize the full index (same as
-    // buildGraphLinks operates on an already-loaded index).
-    using L2Index = flatnav::Index<
-        flatnav::distances::SquaredL2Distance<>,
-        uint32_t>;
-    using IPIndex = flatnav::Index<
-        flatnav::distances::InnerProductDistance<>,
-        uint32_t>;
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+      std::cerr << "Error: Cannot open data file '" << path << "'" << std::endl;
+      std::exit(1);
+    }
 
-    if (_config.metric == MetricType::L2) {
-      auto index = L2Index::loadIndex(path);
+    // Read dimension from the first vector's header.
+    int32_t dimension = 0;
+    file.read(reinterpret_cast<char *>(&dimension), sizeof(int32_t));
+    if (!file.good() || dimension <= 0) {
+      std::cerr << "Error: Failed to read dimension from '" << path << "'"
+                << std::endl;
+      std::exit(1);
+    }
+    _dimension = static_cast<size_t>(dimension);
 
-      _num_vectors = index->currentNumNodes();
-      _dimension = index->dataDimension();
-      size_t data_size_bytes = index->dataSizeBytes();
-      size_t node_size_bytes = index->nodeSizeBytes();
+    // Each vector record: 4 bytes (dim) + dim * 4 bytes (floats).
+    size_t vec_size_bytes = sizeof(int32_t) + _dimension * sizeof(float);
 
-      std::cout << "[loadVectorData] Index metadata:" << std::endl;
-      std::cout << "  M (edges/node)   = " << index->maxEdgesPerNode() << std::endl;
-      std::cout << "  data_size_bytes  = " << data_size_bytes << std::endl;
-      std::cout << "  node_size_bytes  = " << node_size_bytes << std::endl;
-      std::cout << "  max_node_count   = " << index->maxNodeCount() << std::endl;
-      std::cout << "  cur_num_nodes    = " << _num_vectors << std::endl;
-      std::cout << "  dimension        = " << _dimension << std::endl;
+    // Determine total number of vectors from file size.
+    file.seekg(0, std::ios::end);
+    size_t file_size = static_cast<size_t>(file.tellg());
+    file.seekg(0, std::ios::beg);
 
-      // Extract vector data from each node into a contiguous float array.
-      size_t total_floats = _num_vectors * _dimension;
-      _vectors = new float[total_floats];
+    if (file_size % vec_size_bytes != 0) {
+      std::cerr << "Error: File size (" << file_size
+                << ") is not a multiple of vector record size ("
+                << vec_size_bytes << ")" << std::endl;
+      std::exit(1);
+    }
+    _num_vectors = file_size / vec_size_bytes;
 
-      for (size_t i = 0; i < _num_vectors; i++) {
-        const char *node_data = index->getNodeDataPublic(static_cast<uint32_t>(i));
-        std::memcpy(_vectors + (i * _dimension), node_data, data_size_bytes);
+    std::cout << "[loadVectorData] File metadata:" << std::endl;
+    std::cout << "  dimension     = " << _dimension << std::endl;
+    std::cout << "  num_vectors   = " << _num_vectors << std::endl;
+    std::cout << "  file_size     = " << file_size << " bytes" << std::endl;
+
+    // Allocate contiguous float array for all vectors.
+    size_t total_floats = _num_vectors * _dimension;
+    _vectors = new float[total_floats];
+
+    // Read each vector: skip the 4-byte dimension prefix, read the float data.
+    for (size_t i = 0; i < _num_vectors; i++) {
+      int32_t vec_dim = 0;
+      file.read(reinterpret_cast<char *>(&vec_dim), sizeof(int32_t));
+
+      if (static_cast<size_t>(vec_dim) != _dimension) {
+        std::cerr << "Error: Vector " << i << " has dimension " << vec_dim
+                  << " (expected " << _dimension << ")" << std::endl;
+        std::exit(1);
       }
-    } else {
-      auto index = IPIndex::loadIndex(path);
 
-      _num_vectors = index->currentNumNodes();
-      _dimension = index->dataDimension();
-      size_t data_size_bytes = index->dataSizeBytes();
-      size_t node_size_bytes = index->nodeSizeBytes();
+      file.read(reinterpret_cast<char *>(_vectors + (i * _dimension)),
+                static_cast<std::streamsize>(_dimension * sizeof(float)));
+    }
 
-      std::cout << "[loadVectorData] Index metadata:" << std::endl;
-      std::cout << "  M (edges/node)   = " << index->maxEdgesPerNode() << std::endl;
-      std::cout << "  data_size_bytes  = " << data_size_bytes << std::endl;
-      std::cout << "  node_size_bytes  = " << node_size_bytes << std::endl;
-      std::cout << "  max_node_count   = " << index->maxNodeCount() << std::endl;
-      std::cout << "  cur_num_nodes    = " << _num_vectors << std::endl;
-      std::cout << "  dimension        = " << _dimension << std::endl;
-
-      // Extract vector data from each node into a contiguous float array.
-      size_t total_floats = _num_vectors * _dimension;
-      _vectors = new float[total_floats];
-
-      for (size_t i = 0; i < _num_vectors; i++) {
-        const char *node_data = index->getNodeDataPublic(static_cast<uint32_t>(i));
-        std::memcpy(_vectors + (i * _dimension), node_data, data_size_bytes);
-      }
+    if (!file.good()) {
+      std::cerr << "Error: Failed to read all vector data from '" << path
+                << "'" << std::endl;
+      std::exit(1);
     }
 
     // Sanity check: print first vector's first few values.
@@ -505,7 +504,7 @@ static void printUsage(const char *prog) {
                "[--metric l2|ip] [--shm-name <name>]\n"
             << "\n"
             << "Options:\n"
-            << "  --data-file <path>   Path to a serialized flatnav index file "
+            << "  --data-file <path>   Path to .fvecs vector data file "
                "(required)\n"
             << "  --numa-node <id>     NUMA node to bind to (default: 0)\n"
             << "  --threads <N>        Number of worker threads, 1-256 "
