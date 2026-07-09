@@ -66,6 +66,8 @@ class Index {
   // Node consists of: ([data] [M links] [data label]). This layout was chosen
   // after benchmarking - it's slightly more cache-efficient than others.
   size_t _node_size_bytes;
+  // Size of the graph portion of a node (M links + label).
+  size_t _graph_node_size_bytes;
   size_t _max_node_count;  // Determines size of internal pre-allocated memory
   size_t _cur_num_nodes;
   std::unique_ptr<DistanceInterface<dist_t>> _distance;
@@ -108,6 +110,7 @@ class Index {
         _M(other._M),
         _data_size_bytes(other._data_size_bytes),
         _node_size_bytes(other._node_size_bytes),
+        _graph_node_size_bytes(other._graph_node_size_bytes),
         _max_node_count(other._max_node_count),
         _cur_num_nodes(other._cur_num_nodes),
         _distance(std::move(other._distance)),
@@ -127,6 +130,7 @@ class Index {
       _M = other._M;
       _data_size_bytes = other._data_size_bytes;
       _node_size_bytes = other._node_size_bytes;
+      _graph_node_size_bytes = other._graph_node_size_bytes;
       _max_node_count = other._max_node_count;
       _cur_num_nodes = other._cur_num_nodes;
       _distance = std::move(other._distance);
@@ -142,7 +146,7 @@ class Index {
 
   template <typename Archive>
   void serialize(Archive& archive) {
-    archive(_data_type, _M, _data_size_bytes, _node_size_bytes, _max_node_count, _cur_num_nodes, *_distance);
+    archive(_data_type, _M, _data_size_bytes, _node_size_bytes, _graph_node_size_bytes, _max_node_count, _cur_num_nodes, *_distance);
 
     // Serialize the allocated memory for the index & query.
     uint64_t total_mem = static_cast<uint64_t>(_node_size_bytes) * static_cast<uint64_t>(_max_node_count);
@@ -183,6 +187,7 @@ class Index {
 
     _data_size_bytes = _distance->dataSize();
     _node_size_bytes = _data_size_bytes + (sizeof(node_id_t) * _M) + sizeof(label_t);
+    _graph_node_size_bytes = (sizeof(node_id_t) * _M) + sizeof(label_t);
     uint64_t index_size = static_cast<uint64_t>(_node_size_bytes) * static_cast<uint64_t>(_max_node_count);
     _index_memory = new char[index_size];
   }
@@ -810,6 +815,7 @@ public:
             index->_M, 
             index->_data_size_bytes, 
             index->_node_size_bytes, 
+            index->_graph_node_size_bytes,
             index->_max_node_count,
             index->_cur_num_nodes, 
             *dist
@@ -901,6 +907,7 @@ public:
     std::cout << "max_edges_per_node (M): " << _M << "\n" << std::flush;
     std::cout << "data_size_bytes: " << _data_size_bytes << "\n" << std::flush;
     std::cout << "node_size_bytes: " << _node_size_bytes << "\n" << std::flush;
+    std::cout << "graph_node_size_bytes: " << _graph_node_size_bytes << "\n" << std::flush;
     std::cout << "max_node_count: " << _max_node_count << "\n" << std::flush;
     std::cout << "cur_num_nodes: " << _cur_num_nodes << "\n" << std::flush;
 
