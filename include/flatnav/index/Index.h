@@ -546,6 +546,28 @@ private:
     return result;
   }
 
+  // Batched version of computeDistanceCxl: one IPC round-trip for `count`
+  // node ids instead of `count` round-trips. Callers should prefer this over
+  // looping computeDistanceCxl() whenever multiple distances are needed for
+  // the same active query, since the fixed per-round-trip overhead (shared
+  // memory memcpy, atomic fence, spin-wait on both client and server) far
+  // exceeds the cost of the distance computation itself.
+  void computeDistancesCxl(const uint32_t *node_ids, uint32_t count, float *out_distances) {
+    // The wire protocol caps a single request at 1024 node ids (see
+    // Slot::REQUEST_BUFFER_SIZE in CxlSimulation.h), so chunk transparently
+    // for callers that may exceed that (e.g. initializeSearch with a large
+    // num_initializations).
+    constexpr uint32_t kMaxBatch = 1024;
+    for (uint32_t offset = 0; offset < count; offset += kMaxBatch) {
+      uint32_t chunk = std::min(kMaxBatch, count - offset);
+      if (!cxlClient().computeDistances(_cxl_active_query_id, node_ids + offset, chunk,
+                                        out_distances + offset)) {
+        throw std::runtime_error("CXL batch distance computation failed for " +
+                                 std::to_string(chunk) + " nodes");
+      }
+    }
+  }
+
 public:
 #endif
 
@@ -1226,6 +1248,16 @@ public:
     if (_node_visit_counts) _node_visit_counts[node].fetch_add(1, std::memory_order_relaxed);
 #endif
     query_visited_nodes_flags.push_back(_hub_nodes[node]);
+
+#ifdef FLATNAV_CXL_OFFLOAD
+    // Collect all unvisited neighbors first so their distances can be
+    // fetched from the distance server in a single batched round-trip
+    // instead of one round-trip per neighbor (see computeDistancesCxl).
+    static thread_local std::vector<node_id_t> tl_cxl_batch_ids;
+    static thread_local std::vector<float> tl_cxl_batch_dists;
+    tl_cxl_batch_ids.clear();
+#endif
+
     for (uint32_t i = 0; i < _M; i++) {
       node_id_t neighbor_node_id = neighbor_node_links[i];
 
@@ -1253,12 +1285,11 @@ public:
 #endif
 
 #ifdef FLATNAV_CXL_OFFLOAD
-      float dist = computeDistanceCxl(neighbor_node_id);
+      tl_cxl_batch_ids.push_back(neighbor_node_id);
 #else
       float dist = _distance->distance(/* x = */ query,
                                  /* y = */ getNodeData(neighbor_node_id),
                                  /* asymmetric = */ true);
-#endif
 
       if (_collect_stats) {
         _distance_computations.fetch_add(1);
@@ -1273,7 +1304,7 @@ public:
         tl_parent_res[neighbor_node_id] = tl_cur_residency;
 #endif
         // query_visited_nodes_flags.push_back(_hub_nodes[neighbor_node_id]);
-#if defined(USE_SSE) && !defined(FLATNAV_DISABLE_PREFETCH) && !defined(FLATNAV_CXL_OFFLOAD)
+#if defined(USE_SSE) && !defined(FLATNAV_DISABLE_PREFETCH)
         _mm_prefetch(getNodeData(candidates.top().second), _MM_HINT_T0);
 #endif
         if (neighbors.size() > buffer_size) {
@@ -1283,7 +1314,42 @@ public:
           max_dist = neighbors.top().first;
         }
       }
+#endif
     }
+
+#ifdef FLATNAV_CXL_OFFLOAD
+    if (!tl_cxl_batch_ids.empty()) {
+      tl_cxl_batch_dists.resize(tl_cxl_batch_ids.size());
+      computeDistancesCxl(tl_cxl_batch_ids.data(),
+                          static_cast<uint32_t>(tl_cxl_batch_ids.size()),
+                          tl_cxl_batch_dists.data());
+
+      if (_collect_stats) {
+        _distance_computations.fetch_add(tl_cxl_batch_ids.size());
+      }
+
+      for (size_t k = 0; k < tl_cxl_batch_ids.size(); k++) {
+        node_id_t neighbor_node_id = tl_cxl_batch_ids[k];
+        float dist = tl_cxl_batch_dists[k];
+
+        if (neighbors.size() < buffer_size || dist < max_dist) {
+          candidates.emplace(-dist, neighbor_node_id);
+          neighbors.emplace(dist, neighbor_node_id);
+#ifdef FLATNAV_PROFILE_PQ
+          // Node enters the PQ now (discovered during the current expansion).
+          tl_disc[neighbor_node_id] = tl_step;
+          tl_parent_res[neighbor_node_id] = tl_cur_residency;
+#endif
+          if (neighbors.size() > buffer_size) {
+            neighbors.pop();
+          }
+          if (!neighbors.empty()) {
+            max_dist = neighbors.top().first;
+          }
+        }
+      }
+    }
+#endif
   }
 
   /**
@@ -1438,19 +1504,32 @@ public:
       _distance_computations.fetch_add(num_initializations);
     }
 
-    for (node_id_t node = 0; node < _cur_num_nodes; node += step_size) {
 #ifdef FLATNAV_CXL_OFFLOAD
-      float dist = computeDistanceCxl(node);
+    std::vector<node_id_t> candidate_nodes;
+    for (node_id_t node = 0; node < _cur_num_nodes; node += step_size) {
+      candidate_nodes.push_back(node);
+    }
+    std::vector<float> candidate_dists(candidate_nodes.size());
+    computeDistancesCxl(candidate_nodes.data(),
+                        static_cast<uint32_t>(candidate_nodes.size()),
+                        candidate_dists.data());
+    for (size_t i = 0; i < candidate_nodes.size(); i++) {
+      if (candidate_dists[i] < min_dist) {
+        min_dist = candidate_dists[i];
+        entry_node = candidate_nodes[i];
+      }
+    }
 #else
+    for (node_id_t node = 0; node < _cur_num_nodes; node += step_size) {
       float dist = _distance->distance(/* x = */ query,
                                  /* y = */ getNodeData(node),
                                  /* asymmetric = */ true);
-#endif
       if (dist < min_dist) {
         min_dist = dist;
         entry_node = node;
       }
     }
+#endif
     return entry_node;
   }
 
@@ -1470,20 +1549,33 @@ public:
       _distance_computations.fetch_add(num_initializations);
     }
 
+#ifdef FLATNAV_CXL_OFFLOAD
+    std::vector<node_id_t> candidate_nodes(num_initializations);
+    for (int i = 0; i < num_initializations; i++) {
+      candidate_nodes[i] = _distribution(_generator);
+    }
+    std::vector<float> candidate_dists(candidate_nodes.size());
+    computeDistancesCxl(candidate_nodes.data(),
+                        static_cast<uint32_t>(candidate_nodes.size()),
+                        candidate_dists.data());
+    for (size_t i = 0; i < candidate_nodes.size(); i++) {
+      if (candidate_dists[i] < min_dist) {
+        min_dist = candidate_dists[i];
+        entry_node = candidate_nodes[i];
+      }
+    }
+#else
     for (int i = 0; i < num_initializations; i++) {
       node_id_t node = _distribution(_generator);
-#ifdef FLATNAV_CXL_OFFLOAD
-      float dist = computeDistanceCxl(node);
-#else
       float dist = _distance->distance(/* x = */ query,
                                  /* y = */ getNodeData(node),
                                  /* asymmetric = */ true);
-#endif
       if (dist < min_dist) {
         min_dist = dist;
         entry_node = node;
       }
     }
+#endif
     return entry_node;
   }
 
