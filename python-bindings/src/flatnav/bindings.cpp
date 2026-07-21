@@ -5,6 +5,10 @@
 #include <flatnav/index/Index.h>
 #include <flatnav/util/Datatype.h>
 #include <flatnav/util/Multithreading.h>
+#include <iostream>
+#include <memory>
+#include <optional>
+#include <ostream>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -224,6 +228,9 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
     py::array_t<float> dists = py::array_t<float>(
         {num_queries, (size_t)K}, {K * sizeof(float), sizeof(float)}, distances, free_distances_when_done);
 
+    // DistancesLabelsPair is (distances, labels). Returning {labels, dists} here
+    // silently casts the int label array to float32 (and distances to int),
+    // corrupting label ids >= 2^24 (float mantissa limit) for datasets > ~16.7M.
     return {dists, labels};
   }
 
@@ -236,26 +243,25 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
     }
   }
 
-  PyIndex(std::unique_ptr<DistanceInterface<dist_t>>&& distance, DataType data_type, int dataset_size,
-          int max_edges_per_node, bool verbose = false, bool collect_stats = false)
-      : _dim(distance->dimension()),
-        _label_id(0),
-        _verbose(verbose),
+  PyIndex(std::unique_ptr<DistanceInterface<dist_t>> &&distance,
+          DataType data_type, int dataset_size, int max_edges_per_node,
+          bool verbose = false, bool collect_stats = false, 
+          bool use_random_initialization = false,
+          std::optional<size_t> random_seed = std::nullopt)
+      : _dim(distance->dimension()), _label_id(0), _verbose(verbose),
         _index(new Index<dist_t, label_t>(
             /* dist = */ std::move(distance),
             /* dataset_size = */ dataset_size,
             /* max_edges_per_node = */ max_edges_per_node,
-            /* collect_stats = */ collect_stats,
+            /* collect_stats = */ collect_stats, 
+            /* use_random_initialization = */ use_random_initialization,
+            /* random_seed = */ random_seed,
             /* data_type = */ data_type)) {
 
     if (_verbose) {
       uint64_t total_index_memory = _index->getTotalIndexMemory();
       uint64_t visited_set_allocated_memory = _index->visitedSetPoolAllocatedMemory();
-      uint64_t mutexes_allocated_memory = _index->mutexesAllocatedMemory();
-
-      auto total_memory = total_index_memory + visited_set_allocated_memory + mutexes_allocated_memory;
-
-      std::cout << "Total allocated index memory: " << (float)(total_memory / 1e9) << " GB \n" << std::flush;
+      std::cout << "Total allocated index memory: " << (float)(total_index_memory / 1e9) << " GB \n" << std::flush;
       std::cout << "[WARN]: More memory might be allocated due to visited sets "
                    "in multi-threaded environments.\n"
                 << std::flush;
@@ -267,6 +273,10 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
 
   ~PyIndex() { delete _index; }
 
+  inline const std::unordered_map<uint32_t, uint32_t> getNodeAccessCounts() {
+    return _index->getNodeAccessCounts();
+  }
+
   uint64_t getQueryDistanceComputations() const {
     auto distance_computations = _index->distanceComputations();
     _index->resetStats();
@@ -277,8 +287,17 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
     _index->buildGraphLinks(/* mtx_filename = */ mtx_filename);
   }
 
+  void setHubNodes(const std::vector<uint32_t> &hub_nodes) {
+    _index->setHubNodeFlags(hub_nodes);
+  }
 
-  std::vector<std::vector<uint32_t>> getGraphOutdegreeTable() { return _index->getGraphOutdegreeTable(); }
+  std::vector<std::vector<bool>> getVisitedNodesSequence() {
+    return _index->getVisitedNodesSequence();
+  }
+
+  std::vector<std::vector<uint32_t>> getGraphOutdegreeTable() {
+    return _index->getGraphOutdegreeTable();
+  }
 
   uint32_t getMaxEdgesPerNode() { return _index->maxEdgesPerNode(); }
 
@@ -353,74 +372,6 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
         },
         K, ef_search, num_initializations);
   }
-
-  DistancesLabelsPair concurrentBatchSearch(const py::array& queries, int K, int ef_search,
-                                            int num_initializations = 100, uint32_t concurrency = 4) {
-    auto data_type = _index->getDataType();
-    return cast_and_call(
-        data_type, queries,
-        [this](auto&& casted_queries, int k, int ef, int num_init, uint32_t conc) {
-          return this->concurrentBatchSearchImpl(std::forward<decltype(casted_queries)>(casted_queries), k, ef, num_init, conc);
-        },
-        K, ef_search, num_initializations, concurrency);
-  }
-
-  void setSearchConcurrency(uint32_t concurrency) {
-    _index->setSearchConcurrency(concurrency);
-  }
-
-  uint32_t getSearchConcurrency() {
-    return _index->getSearchConcurrency();
-  }
-
-  private:
-  
-    template <typename data_type>
-    DistancesLabelsPair concurrentBatchSearchImpl(
-        const py::array_t<data_type, py::array::c_style | py::array::forcecast>& queries, int K, int ef_search,
-        int num_initializations = 100, uint32_t concurrency = 4) {
-      
-      size_t num_queries = queries.shape(0);
-      size_t queries_dim = queries.shape(1);
-
-      if (queries.ndim() != 2 || queries_dim != _dim) {
-        throw std::invalid_argument("Queries have incorrect dimensions.");
-      }
-
-      label_t* results = new label_t[num_queries * K];
-      float* distances = new float[num_queries * K];
-
-      {
-        // Release python GIL while threads are running
-        py::gil_scoped_release gil;
-        std::vector<std::vector<std::pair<float, label_t>>> all_results = this->_index->concurrentBatchSearch(
-            /* queries = */ (const void*)queries.data(0), /* num_queries = */ num_queries, /* K = */ K,
-            /* ef_search = */ ef_search, /* num_initializations = */ num_initializations,
-            /* concurrency = */ concurrency);
-
-        for (size_t query_index = 0; query_index < num_queries; query_index++) {
-          auto& top_k = all_results[query_index];
-          for (size_t result_id = 0; result_id < static_cast<size_t>(K) && result_id < top_k.size(); result_id++) {
-            distances[(query_index * K) + result_id] = top_k[result_id].first;
-            results[(query_index * K) + result_id] = top_k[result_id].second;
-          }
-        }
-      }
-
-      py::capsule free_results_when_done(results, [](void* ptr) { delete (label_t*)ptr; });
-      py::capsule free_distances_when_done(distances, [](void* ptr) { delete (float*)ptr; });
-
-      py::array_t<label_t> labels = py::array_t<label_t>({num_queries, (size_t)K},  // shape of the array
-                                                         {K * sizeof(label_t), sizeof(label_t)}, results,
-                                                         free_results_when_done);
-
-
-      py::array_t<float> dists = py::array_t<float>(
-          {num_queries, (size_t)K}, {K * sizeof(float), sizeof(float)}, distances, free_distances_when_done);
-      
-      return {dists, labels};
-    }
-
 };
 
 template <typename dist_t>
@@ -527,29 +478,26 @@ void bindSpecialization(py::module_& index_submodule) {
           },
           py::arg("queries"), py::arg("K"), py::arg("ef_search"), py::arg("num_initializations") = 100,
           SEARCH_DOCSTRING)
-      .def(
-          "concurrent_batch_search",
-          [](IndexType& index, const py::array& queries, int K, int ef_search,
-             int num_initializations = 100, uint32_t concurrency = 4) {
-            return index.concurrentBatchSearch(queries, K, ef_search, num_initializations, concurrency);
-          },
-          py::arg("queries"), py::arg("K"), py::arg("ef_search"), py::arg("num_initializations") = 100,
-          py::arg("concurrency") = 4,
-          "Search queries in parallel using concurrent batch search.")
-      .def("set_search_concurrency", &IndexType::setSearchConcurrency, py::arg("concurrency"), "Set the concurrency level for concurrent batch search.")
-      .def_property_readonly("search_concurrency", &IndexType::getSearchConcurrency, "Get the concurrency level for concurrent batch search.")
       .def("get_query_distance_computations", &IndexType::getQueryDistanceComputations,
            GET_QUERY_DISTANCE_COMPUTATIONS_DOCSTRING)
       .def("save", &IndexType::save, py::arg("filename"), SAVE_DOCSTRING)
-      .def("build_graph_links", &IndexType::buildGraphLinks, py::arg("mtx_filename"),
-           BUILD_GRAPH_LINKS_DOCSTRING)
+      .def("get_node_access_counts", &IndexType::getNodeAccessCounts,"")
+      .def("build_graph_links", &IndexType::buildGraphLinks,
+           py::arg("mtx_filename"), BUILD_GRAPH_LINKS_DOCSTRING)
       .def("get_graph_outdegree_table", &IndexType::getGraphOutdegreeTable,
            GET_GRAPH_OUTDEGREE_TABLE_DOCSTRING)
-      .def("reorder", &IndexType::reorder, py::arg("strategies"), REORDER_DOCSTRING)
-      .def("set_num_threads", &IndexType::setNumThreads, py::arg("num_threads"), SET_NUM_THREADS_DOCSTRING)
-      .def_static("load_index", &IndexType::loadIndex, py::arg("filename"), LOAD_INDEX_DOCSTRING)
-      .def_property_readonly("max_edges_per_node", &IndexType::getMaxEdgesPerNode)
-      .def_property_readonly("num_threads", &IndexType::getNumThreads, NUM_THREADS_DOCSTRING);
+      .def("reorder", &IndexType::reorder, py::arg("strategies"),
+           REORDER_DOCSTRING)
+      .def("set_num_threads", &IndexType::setNumThreads, py::arg("num_threads"),
+           SET_NUM_THREADS_DOCSTRING)
+      .def("set_hub_nodes", &IndexType::setHubNodes, py::arg("hub_nodes"))
+      .def("get_visited_nodes_sequence", &IndexType::getVisitedNodesSequence)
+      .def_static("load_index", &IndexType::loadIndex, py::arg("filename"),
+                  LOAD_INDEX_DOCSTRING)
+      .def_property_readonly("max_edges_per_node",
+                             &IndexType::getMaxEdgesPerNode)
+      .def_property_readonly("num_threads", &IndexType::getNumThreads,
+                             NUM_THREADS_DOCSTRING);
 }
 
 void defineIndexSubmodule(py::module_& index_submodule) {
@@ -562,25 +510,36 @@ void defineIndexSubmodule(py::module_& index_submodule) {
 
   index_submodule.def(
       "create",
-      [](const std::string& distance_type, int dim, int dataset_size, int max_edges_per_node,
-         DataType index_data_type, bool verbose = false, bool collect_stats = false) {
+      [](const std::string &distance_type, int dim, int dataset_size,
+         int max_edges_per_node, DataType index_data_type, bool verbose = false,
+         bool collect_stats = false, bool use_random_initialization = false,
+         std::optional<size_t> random_seed = std::nullopt) {
         switch (index_data_type) {
-          case DataType::float32:
-            return createIndex<DataType::float32>(distance_type, dim, dataset_size, max_edges_per_node,
-                                                  verbose, collect_stats);
-          case DataType::int8:
-            return createIndex<DataType::int8>(distance_type, dim, dataset_size, max_edges_per_node, verbose,
-                                               collect_stats);
-          case DataType::uint8:
-            return createIndex<DataType::uint8>(distance_type, dim, dataset_size, max_edges_per_node, verbose,
-                                                collect_stats);
-          default:
-            throw std::runtime_error("Unsupported data type");
+        case DataType::float32:
+          return createIndex<DataType::float32>(
+              distance_type, dim, dataset_size, max_edges_per_node, verbose,
+              collect_stats, use_random_initialization, random_seed);
+        case DataType::int8:
+          return createIndex<DataType::int8>(distance_type, dim, dataset_size,
+                                             max_edges_per_node, verbose,
+                                             collect_stats, use_random_initialization,
+                                             random_seed);
+        case DataType::uint8:
+          return createIndex<DataType::uint8>(distance_type, dim, dataset_size,
+                                              max_edges_per_node, verbose,
+                                              collect_stats, use_random_initialization,
+                                              random_seed);
+        default:
+          throw std::runtime_error("Unsupported data type");
         }
       },
-      py::arg("distance_type"), py::arg("dim"), py::arg("dataset_size"), py::arg("max_edges_per_node"),
-      py::arg("index_data_type") = DataType::float32, py::arg("verbose") = false,
-      py::arg("collect_stats") = false, CONSTRUCTOR_DOCSTRING);
+      py::arg("distance_type"), py::arg("dim"), py::arg("dataset_size"),
+      py::arg("max_edges_per_node"),
+      py::arg("index_data_type") = DataType::float32,
+      py::arg("verbose") = false, py::arg("collect_stats") = false,
+      py::arg("use_random_initialization") = false,
+      py::arg("random_seed") = std::nullopt,
+      CONSTRUCTOR_DOCSTRING);
 }
 
 void defineDatatypeEnums(py::module_& module) {

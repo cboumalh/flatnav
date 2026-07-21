@@ -143,6 +143,12 @@ def build_flatnav_index_from_graph_file(
     graph_load_sec = time.time() - graph_load_start
     logging.info("Loaded graph links from %s in %.2f sec", mtx_filename, graph_load_sec)
 
+    save_dir = Path("/data/index")
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_path = save_dir / "flatnav.index"
+    index.save(str(save_path))
+    logging.info("Saved FlatNav index to %s", save_path)
+
     return index, time.time() - build_start
 
 
@@ -355,50 +361,55 @@ def run_recall_only(
     results: Dict[str, Dict[str, float]] = {}
 
     for ef_search in ef_search_values:
-        logging.info("Running batched queries with ef_search=%d", ef_search)
-        input("Press Enter to start the query batch for ef_search=%d..." % ef_search)
-        logging.info("QUERY_BENCHMARK_START ef_search=%d", ef_search)
+        logging.info("Running sequential queries with ef_search=%d", ef_search)
         start = time.time()
+        recalls = []
         failed_queries = 0
+        num_queries_total = len(queries)
+        progress_checkpoints = {
+            max(1, int(round((num_queries_total * step) / 10.0)))
+            for step in range(1, 11)
+        }
 
-        _, neighbors = index.concurrent_batch_search(
-            queries=queries,
-            K=effective_k,
-            ef_search=ef_search,
-            num_initializations=100,
-            concurrency=8
-        )
+        for i, query in enumerate(queries):
+            try:
+                _, neighbors = index.search_single(
+                    query=query,
+                    ef_search=ef_search,
+                    K=effective_k,
+                    num_initializations=100,
+                )
+            except RuntimeError:
+                failed_queries += 1
+                continue
+            recalls.append(compute_recall_at_k(neighbors, ground_truth[i], effective_k))
 
-        recalls = [
-            compute_recall_at_k(neighbors[i], ground_truth[i], effective_k)
-            for i in range(len(queries))
-        ]
+            processed = i + 1
+            if processed in progress_checkpoints:
+                running_avg_recall = float(np.mean(recalls)) if recalls else 0.0
+                logging.info(
+                    "Processed %d/%d queries, running_recall@%d=%.6f, failed=%d",
+                    processed,
+                    num_queries_total,
+                    effective_k,
+                    running_avg_recall,
+                    failed_queries,
+                )
 
         total_sec = time.time() - start
-        input("Press Enter to finish the query batch for ef_search=%d..." % ef_search)
         avg_recall = float(np.mean(recalls)) if recalls else 0.0
-        const_queries = max(1, len(queries))
-        p50_latency_ms = 0.0
-        p99_latency_ms = 0.0
         results[str(ef_search)] = {
             "recall": avg_recall,
             "total_time_sec": total_sec,
-            "avg_time_ms_per_query": (total_sec * 1000.0) / const_queries,
-            "qps": len(queries) / max(total_sec, 1e-12),
-            "p50_latency_ms": p50_latency_ms,
-            "p99_latency_ms": p99_latency_ms,
+            "avg_time_ms_per_query": (total_sec * 1000.0) / max(1, len(queries)),
             "failed_queries": failed_queries,
         }
-        logging.info("QUERY_BENCHMARK_END ef_search=%d", ef_search)
         logging.info(
-            "ef_search=%d recall@%d=%.6f total_time=%.2fs qps=%.2f p50=%.2fms p99=%.2fms failed=%d",
+            "ef_search=%d recall@%d=%.6f total_time=%.2fs failed=%d",
             ef_search,
             effective_k,
             avg_recall,
             total_sec,
-            results[str(ef_search)]["qps"],
-            p50_latency_ms,
-            p99_latency_ms,
             failed_queries,
         )
 

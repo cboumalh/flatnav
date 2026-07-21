@@ -1,0 +1,28 @@
+{
+  "dataset": "/data/index/sift100m_base.fvecs",
+  "queries": "/data/queries/sift100m_200k_extra_query.fvecs",
+  "ground_truth": "/data/queries/sift100m_200k_extra_query.gtruth.ivecs",
+  "metric": "l2",
+  "dataset_size": 100000000,
+  "dim": 128,
+  "num_queries": 200000,
+  "num_node_links": 32,
+  "ef_construction": 100,
+  "num_build_threads": 1,
+  "num_search_threads": 1,
+  "k": 100,
+  "build_time_sec": 567.9458725452423,
+  "faiss_flatl2_validation": {
+    "enabled": false,
+    "executed": false,
+    "reason": "Validation not requested."
+  },
+  "results": {
+    "200": {
+      "recall": 0.8890201877652332,
+      "total_time_sec": 486.2486324310303,
+      "avg_time_ms_per_query": 2.4312431621551513,
+      "failed_queries": 176
+    }
+  }
+}

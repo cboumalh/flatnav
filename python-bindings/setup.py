@@ -80,7 +80,8 @@ def construct_cmake_args() -> List[str]:
             "-ffast-math",
             "-funroll-loops",
             # Keep native architecture only for Linux
-            "-march=native"  
+            "-march=native"#,
+            #"-DFLATNAV_CXL_OFFLOAD",
         ]
 
     # Add SIMD flags if SIMD vectorization is enabled

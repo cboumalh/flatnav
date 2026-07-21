@@ -47,6 +47,35 @@ def read_bvecs_file(filename: str, range: Optional[tuple[int, int]] = None) -> n
         return v.reshape((end - start + 1, dimension + 4))[:, 4:]
 
 
+def read_fvecs_file(filename: str, range: Optional[tuple[int, int]] = None) -> np.ndarray:
+    with open(filename, "rb") as f:
+        dimension = np.fromfile(f, dtype=np.int32, count=1)[0]
+        vec_size = (dimension + 1) * 4
+
+        f.seek(0, 2)
+        total_vectors = f.tell() // vec_size
+
+    # Use 0-based, end-exclusive ranges to match numpy slicing semantics.
+    start, end = 0, total_vectors
+    if range:
+        start, end = range
+        end = min(end, total_vectors)
+
+    assert 0 <= start <= end <= total_vectors, "Invalid range specified."
+
+    offset_bytes = start * vec_size
+    count_vectors = end - start
+
+    data = np.memmap(
+        filename,
+        dtype=np.float32,
+        mode="r",
+        offset=offset_bytes,
+        shape=(count_vectors, dimension + 1),
+    )
+    return data[:, 1:]
+
+
 class DatasetLoader(ABC):
     def __init__(
         self,
@@ -100,8 +129,26 @@ class NpyDatasetLoader(DatasetLoader):
             train_dataset = np.load(self.train_dataset_path).astype(
                 np.float32, copy=False
             )
-        queries = np.load(self.queries_path).astype(np.float32, copy=False)
-        ground_truth = np.load(self.ground_truth_path).astype(np.int32, copy=False)
+
+        if self.queries_path.endswith(".npy"):
+            queries = np.load(self.queries_path).astype(np.float32, copy=False)
+        elif self.queries_path.endswith(".fvecs"):
+            queries = read_fvecs_file(self.queries_path)
+        elif self.queries_path.endswith(".bvecs"):
+            queries = read_bvecs_file(self.queries_path)
+        else:
+            raise ValueError(
+                "Invalid file extension for queries. Expected .npy, .fvecs, or .bvecs"
+            )
+
+        if self.ground_truth_path.endswith(".npy"):
+            ground_truth = np.load(self.ground_truth_path).astype(np.int32, copy=False)
+        elif self.ground_truth_path.endswith(".ivecs"):
+            ground_truth = read_ivecs_file(self.ground_truth_path)
+        else:
+            raise ValueError(
+                "Invalid file extension for ground truth. Expected .npy or .ivecs"
+            )
         return train_dataset, queries, ground_truth
 
 
@@ -121,6 +168,34 @@ class BvecsDatasetLoader(DatasetLoader):
 
         train_data = read_bvecs_file(self.train_dataset_path, self.range)
         queries_data = read_bvecs_file(self.queries_path, self.range)
+
+        return train_data, queries_data, ground_truth
+
+
+class FvecsDatasetLoader(DatasetLoader):
+    def load_data(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        train_data = read_fvecs_file(self.train_dataset_path, self.range)
+
+
+        if self.queries_path.endswith(".npy"):
+            queries_data = np.load(self.queries_path).astype(np.float32, copy=False)
+        elif self.queries_path.endswith(".fvecs"):
+            queries_data = read_fvecs_file(self.queries_path)
+        else:
+            raise ValueError(
+                "Invalid file extension for queries. Expected .npy or .fvecs"
+            )
+
+        if self.ground_truth_path.endswith(".npy"):
+            ground_truth = np.load(self.ground_truth_path).astype(np.int32, copy=False)
+        elif self.ground_truth_path.endswith(".ivecs"):
+            ground_truth = read_ivecs_file(self.ground_truth_path)
+            ground_truth = ground_truth[:, 0:100]
+        else:
+            raise ValueError(
+                "Invalid file extension for ground truth. Expected .npy or .ivecs"
+            )
+
 
         return train_data, queries_data, ground_truth
 
@@ -231,6 +306,7 @@ def get_data_loader(**kwargs) -> DatasetLoader:
     file_extension_to_loader = {
         ".npy": NpyDatasetLoader,
         ".bvecs": BvecsDatasetLoader,
+        ".fvecs": FvecsDatasetLoader,
         ".fbin": lambda **kw: BinaryDatasetLoader(dtype=np.float32, **kw),
         ".u8bin": lambda **kw: BinaryDatasetLoader(dtype=np.uint8, **kw),
         ".i8bin": lambda **kw: BinaryDatasetLoader(dtype=np.int8, **kw),

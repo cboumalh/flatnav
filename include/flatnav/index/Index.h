@@ -1,12 +1,12 @@
 #pragma once
 
 #include <flatnav/distances/DistanceInterface.h>
-#include <flatnav/index/QueryState.h>
 #include <flatnav/util/Macros.h>
 #include <flatnav/util/Multithreading.h>
 #include <flatnav/util/Reordering.h>
 #include <flatnav/util/VisitedSetPool.h>
 #include <flatnav/util/Datatype.h>
+#include <flatnav/util/NumaAllocation.h>
 #include <flatnav/util/CxlSimulation.h>
 #include <algorithm>
 #include <atomic>
@@ -17,22 +17,104 @@
 #include <cereal/types/memory.hpp>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
+#include <random>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <optional>
-#include <flatnav/util/PhaseProfiler.h>
 
 using flatnav::distances::DistanceInterface;
 using flatnav::util::VisitedSet;
 using flatnav::util::VisitedSetPool;
 using flatnav::util::DataType;
+using flatnav::util::kNoNumaNode;
+
+#ifdef FLATNAV_PROFILE_PQ
+#pragma message("Index.h: FLATNAV_PROFILE_PQ is defined")
+#else
+#pragma message("Index.h: FLATNAV_PROFILE_PQ is NOT defined")
+#endif
+
+#ifdef FLATNAV_CXL_OFFLOAD
+#pragma message("Index.h: FLATNAV_CXL_OFFLOAD is defined")
+#else
+#pragma message("Index.h: FLATNAV_CXL_OFFLOAD is NOT defined")
+#endif
+
+#ifdef FLATNAV_PROFILE_VISITS
+#pragma message("Index.h: FLATNAV_PROFILE_VISITS is defined")
+#else
+#pragma message("Index.h: FLATNAV_PROFILE_VISITS is NOT defined")
+#endif
+
+#ifdef FLATNAV_PROFILE_NOINLINE
+#pragma message("Index.h: FLATNAV_PROFILE_NOINLINE is defined")
+#else
+#pragma message("Index.h: FLATNAV_PROFILE_NOINLINE is NOT defined")
+#endif
+
+#ifdef FLATNAV_DISABLE_PREFETCH
+#pragma message("Index.h: FLATNAV_DISABLE_PREFETCH is defined")
+#else
+#pragma message("Index.h: FLATNAV_DISABLE_PREFETCH is NOT defined")
+#endif
+
+#ifdef USE_SSE
+#pragma message("Index.h: USE_SSE is defined")
+#else
+#pragma message("Index.h: USE_SSE is NOT defined")
+#endif
 
 namespace flatnav {
+
+#ifdef FLATNAV_PROFILE_PQ
+// Candidate-PQ residency instrumentation (tier-prefetch study). A node's prefetch
+// lead time = its PQ residency = (pop_step - discovery_step). Per-thread maps track
+// discovery step + parent residency; global atomic histograms aggregate across queries.
+inline constexpr int kPQHistCap = 4096;
+inline std::atomic<uint64_t> g_pq_residency_hist[kPQHistCap];     // residency of every expanded node
+inline std::atomic<uint64_t> g_leapfrog_parent_hist[kPQHistCap];  // parent residency of residency==1 nodes
+// Per-search-step (pop/hop index) buckets, for the early-vs-late predictability split.
+inline constexpr int kPQStepCap = 1024;
+inline std::atomic<uint64_t> g_step_count[kPQStepCap];   // # expansions at this step
+inline std::atomic<uint64_t> g_step_leap[kPQStepCap];    // of those, residency==1 (leapfroggers)
+inline std::atomic<uint64_t> g_step_sumres[kPQStepCap];  // sum of residency (for mean)
+inline thread_local std::unordered_map<uint32_t, uint32_t> tl_disc;        // node -> discovery step
+inline thread_local std::unordered_map<uint32_t, uint32_t> tl_parent_res;  // node -> parent's residency
+inline thread_local uint32_t tl_step;          // pops done so far this query
+inline thread_local uint32_t tl_cur_residency; // residency of the node currently being expanded
+// "top-K candidate prefetch" policy: each step, just after the current node is popped (and BEFORE
+// its neighbors are discovered), we'd prefetch the K closest pending candidates. Because the snapshot
+// is taken pre-expansion, this step's leapfroggers (not yet born) are excluded from every K. A node
+// is "prefetched" once, at the first step it enters the top-K. success = eventually popped; waste =
+// never popped. Buckets keyed by first-prefetch step; lead = pop_step - first_prefetch_step.
+inline constexpr int kPFnumK = 4;
+inline constexpr int kPFK[kPFnumK] = {1, 5, 10, 50};
+inline std::atomic<uint64_t> g_pf_prefetched[kPFnumK][kPQStepCap];
+inline std::atomic<uint64_t> g_pf_success[kPFnumK][kPQStepCap];
+inline std::atomic<uint64_t> g_pf_leadsum[kPFnumK];
+struct PFEntry {
+  uint16_t fe[kPFnumK] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF}; // first step entered top-K (0xFFFF=never)
+  uint16_t pop_step = 0;
+  bool popped = false;
+};
+inline thread_local std::unordered_map<uint32_t, PFEntry> tl_pf;
+// Pre-expansion K=1 NEXT-STEP precision: at each step we prefetch the 2nd-min (next candidate);
+// did exactly that node get popped at the immediately next step? (= used with 1-step lead, the
+// strictest "is the next vector known" test). Bucketed by the prefetch step.
+inline std::atomic<uint64_t> g_pf1_next_total[kPQStepCap];
+inline std::atomic<uint64_t> g_pf1_next_hit[kPQStepCap];
+inline thread_local uint32_t tl_pf1_node;   // 2nd-min prefetched last step
+inline thread_local uint32_t tl_pf1_step;   // the step it was prefetched at
+inline thread_local bool tl_pf1_valid;
+#endif
 
 // dist_t: A distance function implementing DistanceInterface.
 // label_t: A fixed-width data type for the label (meta-data) of each point.
@@ -42,7 +124,6 @@ class Index {
   // internal node numbering scheme. We might need to change this to uint64_t
   typedef uint32_t node_id_t;
   typedef std::pair<float, node_id_t> dist_node_t;
-  using Qstate = QueryState<dist_node_t, node_id_t>;
 
   // NOTE: by default this is a max-heap. We could make this a min-heap
   // by using std::greater, but we want to use the queue as both a max-heap and
@@ -53,20 +134,29 @@ class Index {
       return a.first < b.first;
     }
   };
-  static constexpr CompareByFirst cmp{};
 
   typedef std::priority_queue<dist_node_t, std::vector<dist_node_t>, CompareByFirst> PriorityQueue;
 
-  // Large (several GB), pre-allocated block of memory.
-  char* _index_memory;
+  // NUMA-aware storage. The data and the graph are kept in two separate,
+  // contiguous (structure-of-arrays) allocations so each can be bound to its
+  // own NUMA node.
+  //   Vectors block: one [data] entry per node,         stride _data_size_bytes.
+  //   Graph block:   one [M links][label] entry per node, stride
+  //                  _graph_node_size_bytes.
+  char* _vectors_memory = nullptr;
+  char* _graph_memory = nullptr;
+  int _vectors_numa_node = kNoNumaNode;
+  int _graph_numa_node = kNoNumaNode;
 
   size_t _M;
   // size of one data point (does not support variable-size data, strings)
   size_t _data_size_bytes;
-  // Node consists of: ([data] [M links] [data label]). This layout was chosen
-  // after benchmarking - it's slightly more cache-efficient than others.
+  // Logical size of a node: [data] + [M links] + [label]. The data lives in
+  // _vectors_memory and the links+label live in _graph_memory, so this is kept
+  // only for reporting/serialization metadata. It satisfies
+  // _node_size_bytes == _data_size_bytes + _graph_node_size_bytes.
   size_t _node_size_bytes;
-  // Size of the graph portion of a node (M links + label).
+  // Size of one entry in _graph_memory: [M links][label].
   size_t _graph_node_size_bytes;
   size_t _max_node_count;  // Determines size of internal pre-allocated memory
   size_t _cur_num_nodes;
@@ -74,7 +164,6 @@ class Index {
   std::mutex _index_data_guard;
 
   uint32_t _num_threads;
-  uint32_t _search_concurrency = 4;
 
   // Remembers which nodes we've visited, to avoid re-computing distances.
   VisitedSetPool* _visited_set_pool;
@@ -84,7 +173,11 @@ class Index {
   DataType _data_type;
 
 #ifdef FLATNAV_CXL_OFFLOAD
-  std::unique_ptr<flatnav::util::CxlClient> _cxl_client;
+  // Name of the distance server's shared-memory segment. Each OS thread that
+  // performs search gets its own CxlClient, connected lazily (see
+  // cxlClient()) rather than eagerly sharing a single client across threads.
+  std::string _cxl_shm_name;
+  std::atomic<uint32_t> _cxl_next_slot{0};
   std::atomic<uint64_t> _cxl_query_id_counter{0};
 #endif
 
@@ -96,17 +189,53 @@ class Index {
   mutable std::atomic<uint64_t> _distance_computations = 0;
   mutable std::atomic<uint64_t> _metric_hops = 0;
 
-  Index(const Index&) = delete;
-  Index& operator=(const Index&) = delete;
+  // Keep track of the sequence of nodes visited during search.
+  // Each internal list consists of a sequence of boolean flags indicating
+  // whether a visited node is a hub node or not.
+  std::vector<std::vector<bool>> _visited_nodes_sequence;
+
+  bool* _hub_nodes = nullptr; // A boolean array to keep track of hub nodes.
+  // If a node is a hub, then _hub_nodes[node] = true, else false.
+
+  // Tracking metrics for node access patterns. This unordered map is used to
+  // record how many times each node is visited during search. The key is the
+  // node id and the value is the number of times the node is visited.
+  std::unordered_map<uint32_t, uint32_t> _node_access_counts;
+
+  // Optional flat per-node graph-link visit counter for the caching study.
+  // Allocated only when enableVisitProfiling() is called (400 MB at 100M nodes);
+  // incremented in processCandidateNode (hot path) only under FLATNAV_PROFILE_VISITS,
+  // so non-profiling builds are byte-identical on the search path.
+  std::atomic<uint32_t>* _node_visit_counts = nullptr;
+  // Companion counter: per-node DATA (vector) accesses = full activated footprint
+  // (superset of link-expanded nodes). Also allocated by enableVisitProfiling().
+  std::atomic<uint32_t>* _node_data_counts = nullptr;
+
+  // Design-1 (SSSP) common source: when >= 0, every search starts from this fixed
+  // entry node (skipping the per-query initialization scan), so all traversals are
+  // rooted at one vertex. Set via setFixedEntryNode(); -1 = normal per-query entry.
+  int64_t _fixed_entry_node = -1;
+
+  // Randomization parameters
+  bool _use_random_initialization = false;
+  std::mt19937 _generator;
+  std::uniform_int_distribution<> _distribution;
+
+
+  Index(const Index &) = delete;
+  Index &operator=(const Index &) = delete;
 
   // A custom move constructor is needed because the class manages dynamic
-  // resources (_index_memory, _visited_set_pool),
+  // resources (_vectors_memory, _graph_memory, _visited_set_pool),
   // which require explicit ownership transfer and cleanup to avoid resource
   // leaks or double frees. The default move constructor cannot ensure these
   // resources are safely transferred and the source object is left in a valid
   // state.
   Index(Index&& other) noexcept
-      : _index_memory(other._index_memory),
+      : _vectors_memory(other._vectors_memory),
+        _graph_memory(other._graph_memory),
+        _vectors_numa_node(other._vectors_numa_node),
+        _graph_numa_node(other._graph_numa_node),
         _M(other._M),
         _data_size_bytes(other._data_size_bytes),
         _node_size_bytes(other._node_size_bytes),
@@ -116,17 +245,25 @@ class Index {
         _distance(std::move(other._distance)),
         _num_threads(other._num_threads),
         _visited_set_pool(std::move(other._visited_set_pool)),
-        _node_links_mutexes(std::move(other._node_links_mutexes)) {
-    other._index_memory = nullptr;
+        _node_links_mutexes(std::move(other._node_links_mutexes)),
+        _hub_nodes(other._hub_nodes) {
+    other._vectors_memory = nullptr;
+    other._graph_memory = nullptr;
     other._visited_set_pool = nullptr;
+    other._hub_nodes = nullptr;
   }
 
   Index& operator=(Index&& other) noexcept {
     if (this != &other) {
-      delete[] _index_memory;
+      util::freeBytes(_vectors_memory, vectorsMemoryBytes(), _vectors_numa_node);
+      util::freeBytes(_graph_memory, graphMemoryBytes(), _graph_numa_node);
       delete _visited_set_pool;
+      delete[] _hub_nodes;
 
-      _index_memory = other._index_memory;
+      _vectors_memory = other._vectors_memory;
+      _graph_memory = other._graph_memory;
+      _vectors_numa_node = other._vectors_numa_node;
+      _graph_numa_node = other._graph_numa_node;
       _M = other._M;
       _data_size_bytes = other._data_size_bytes;
       _node_size_bytes = other._node_size_bytes;
@@ -137,20 +274,25 @@ class Index {
       _num_threads = other._num_threads;
       _visited_set_pool = std::move(other._visited_set_pool);
       _node_links_mutexes = std::move(other._node_links_mutexes);
+      _hub_nodes = other._hub_nodes;
 
-      other._index_memory = nullptr;
+      other._vectors_memory = nullptr;
+      other._graph_memory = nullptr;
       other._visited_set_pool = nullptr;
+      other._hub_nodes = nullptr;
     }
     return *this;
   }
 
   template <typename Archive>
   void serialize(Archive& archive) {
-    archive(_data_type, _M, _data_size_bytes, _node_size_bytes, _graph_node_size_bytes, _max_node_count, _cur_num_nodes, *_distance);
+    archive(_data_type, _M, _data_size_bytes, _node_size_bytes,
+            _graph_node_size_bytes, _max_node_count, _cur_num_nodes, *_distance);
 
-    // Serialize the allocated memory for the index & query.
-    uint64_t total_mem = static_cast<uint64_t>(_node_size_bytes) * static_cast<uint64_t>(_max_node_count);
-    archive(cereal::binary_data(_index_memory, total_mem));
+    // Serialize the two storage regions separately. NUMA placement is a runtime
+    // concern and is intentionally not persisted.
+    archive(cereal::binary_data(_vectors_memory, vectorsMemoryBytes()));
+    archive(cereal::binary_data(_graph_memory, graphMemoryBytes()));
   }
 
  public:
@@ -169,60 +311,236 @@ class Index {
    * @param collect_stats Flag indicating whether to collect statistics during
    * the search process.
    */
-  Index(std::unique_ptr<DistanceInterface<dist_t>> dist, int dataset_size, int max_edges_per_node,
-        bool collect_stats = false, DataType data_type = DataType::float32)
-      : _M(max_edges_per_node),
-        _max_node_count(dataset_size),
-        _cur_num_nodes(0),
-        _distance(std::move(dist)),
-        _num_threads(1),
+  Index(std::unique_ptr<DistanceInterface<dist_t>> dist, int dataset_size,
+        int max_edges_per_node, bool collect_stats = false,
+        bool use_random_initialization = false,
+        std::optional<size_t> random_seed = std::nullopt,
+        DataType data_type = DataType::float32,
+        int vectors_numa_node = kNoNumaNode, int graph_numa_node = kNoNumaNode)
+      : _vectors_numa_node(vectors_numa_node), _graph_numa_node(graph_numa_node),
+        _M(max_edges_per_node), _max_node_count(dataset_size),
+        _cur_num_nodes(0), _distance(std::move(dist)), _num_threads(1),
         _visited_set_pool(new VisitedSetPool(
             /* initial_pool_size = */ 1,
             /* num_elements = */ dataset_size)),
-        _node_links_mutexes(dataset_size),
-        _collect_stats(collect_stats), _data_type(data_type) {
+        _node_links_mutexes(dataset_size), _collect_stats(collect_stats),
+        _use_random_initialization(use_random_initialization),
+        _data_type(data_type) {
 
-    // Get the size in bytes of the _node_links_mutexes vector.
-    size_t mutexes_size_bytes = _node_links_mutexes.size() * sizeof(std::mutex);
+    if (random_seed.has_value()) {
+      _generator = std::mt19937(random_seed.value());
+      _distribution = std::uniform_int_distribution<>(0, _max_node_count - 1);
+    }
+
+    initNodeAccessCounts();
 
     _data_size_bytes = _distance->dataSize();
-    _node_size_bytes = _data_size_bytes + (sizeof(node_id_t) * _M) + sizeof(label_t);
     _graph_node_size_bytes = (sizeof(node_id_t) * _M) + sizeof(label_t);
-    uint64_t index_size = static_cast<uint64_t>(_node_size_bytes) * static_cast<uint64_t>(_max_node_count);
-    _index_memory = new char[index_size];
+    _node_size_bytes = _data_size_bytes + _graph_node_size_bytes;
 
+    _vectors_memory =
+        util::allocateBytes(vectorsMemoryBytes(), _vectors_numa_node);
+    _graph_memory = util::allocateBytes(graphMemoryBytes(), _graph_numa_node);
+
+    _hub_nodes = new bool[_max_node_count];
+    std::fill_n(_hub_nodes, _max_node_count, false);
 #ifdef FLATNAV_CXL_OFFLOAD
     connectToDistanceServer("/flatnav_cxl");
 #endif
   }
 
+  void initNodeAccessCounts() {
+    // Initialize the node access counts to 0 for all nodes.
+    for (uint32_t i = 0; i < _max_node_count; i++) {
+      _node_access_counts[i] = 0;
+    }
+  }
+
   ~Index() {
-    delete[] _index_memory;
+    util::freeBytes(_vectors_memory, vectorsMemoryBytes(), _vectors_numa_node);
+    util::freeBytes(_graph_memory, graphMemoryBytes(), _graph_numa_node);
     delete _visited_set_pool;
+    delete[] _hub_nodes;
+    delete[] _node_visit_counts;
+    delete[] _node_data_counts;
+  }
+
+  /**
+   * @brief re-prune the graph by removing edges to hub nodes.
+   * @param hub_nodes The hub nodes to prune edges from.
+   * @param alpha The pruning threshold. \alpha ranges from 0 to 1.
+   * Ex. if alpha = 0.5, then we remove 50% of the edges from the hub nodes.
+   * Edge removal is done by setting the edge to the node itself.
+   * The edge selection process is done using random selection.
+   */
+  void rePruneGraph(const std::vector<uint32_t> &hub_nodes, float alpha) {
+
+    if (alpha < 0 || alpha > 1) {
+      throw std::invalid_argument("Alpha must be in the range [0, 1].");
+    }
+
+    std::vector<std::pair<uint32_t, uint32_t>> edges_between_hub_nodes;
+    for (const auto &hub_node : hub_nodes) {
+      node_id_t *links = getNodeLinks(hub_node);
+      for (size_t i = 0; i < _M; i++) {
+        if (links[i] != hub_node) {
+          edges_between_hub_nodes.emplace_back(hub_node, links[i]);
+        }
+      }
+    }
+
+    // Now randomly pick alpha * |edges_between_hub_nodes| edges to remove.
+    std::shuffle(edges_between_hub_nodes.begin(), edges_between_hub_nodes.end(),
+                 _generator);
+
+    size_t num_edges_to_remove =
+        static_cast<size_t>(alpha * edges_between_hub_nodes.size());
+    for (size_t i = 0; i < num_edges_to_remove; i++) {
+      auto [a, b] = edges_between_hub_nodes[i];
+      node_id_t *links = getNodeLinks(a);
+      for (size_t j = 0; j < _M; j++) {
+        if (links[j] == b) {
+          links[j] = a;
+          break;
+        }
+      }
+    }
+  }
+
+  void resetNodeAccessDistribution() { _node_access_counts.clear(); }
+
+  // Caching study: allocate the flat per-node link-expansion + data-access counters (zeroed).
+  void enableVisitProfiling() {
+    delete[] _node_visit_counts;
+    delete[] _node_data_counts;
+    _node_visit_counts = new std::atomic<uint32_t>[_max_node_count]();
+    _node_data_counts = new std::atomic<uint32_t>[_max_node_count]();
+  }
+  const std::atomic<uint32_t>* nodeVisitCounts() const { return _node_visit_counts; }
+  const std::atomic<uint32_t>* nodeDataCounts() const { return _node_data_counts; }
+
+  // Design-1 SSSP: fix the common source vertex for all subsequent searches.
+  void setFixedEntryNode(int64_t s) { _fixed_entry_node = s; }
+
+  // Medoid = node nearest to the dataset mean vector (a principled central source).
+  // Two streaming passes over the vectors.
+  node_id_t computeMedoid() {
+    const size_t dim = _data_size_bytes / sizeof(float);
+    std::vector<double> mean(dim, 0.0);
+    for (node_id_t n = 0; n < _cur_num_nodes; n++) {
+      const float* v = reinterpret_cast<const float*>(getNodeData(n));
+      for (size_t d = 0; d < dim; d++) mean[d] += v[d];
+    }
+    std::vector<float> m(dim);
+    for (size_t d = 0; d < dim; d++) m[d] = static_cast<float>(mean[d] / (double)_cur_num_nodes);
+    node_id_t best = 0; double best_dist = std::numeric_limits<double>::max();
+    for (node_id_t n = 0; n < _cur_num_nodes; n++) {
+      const float* v = reinterpret_cast<const float*>(getNodeData(n));
+      double s = 0;
+      for (size_t d = 0; d < dim; d++) { double diff = (double)v[d] - m[d]; s += diff * diff; }
+      if (s < best_dist) { best_dist = s; best = n; }
+    }
+    return best;
+  }
+
+  // Public access to relabel for external placement policies (P[old]=new id).
+  void reorderByPermutation(const std::vector<node_id_t>& P) { relabel(P); }
+
+  // In-degree of every node = number of incoming out-edges from other nodes
+  // (self-loops excluded). A "hub" is then defined as a top-percentile in-degree node.
+  std::vector<uint32_t> computeInDegrees() {
+    std::vector<uint32_t> indeg(_cur_num_nodes, 0);
+    for (node_id_t u = 0; u < _cur_num_nodes; u++) {
+      const node_id_t* links = getNodeLinks(u);
+      for (uint32_t i = 0; i < _M; i++) {
+        node_id_t w = links[i];
+        if (w < _cur_num_nodes && w != u) indeg[w]++;
+      }
+    }
+    return indeg;
+  }
+
+  // Hop (graph-BFS) distance from `source` to every node over out-edges; 255 = unreachable.
+  std::vector<uint8_t> bfsHopDistances(node_id_t source) {
+    std::vector<uint8_t> dist(_cur_num_nodes, 255);
+    std::vector<node_id_t> frontier, next;
+    dist[source] = 0; frontier.push_back(source);
+    uint8_t h = 0;
+    while (!frontier.empty() && h < 254) {
+      for (node_id_t u : frontier) {
+        const node_id_t* links = getNodeLinks(u);
+        for (uint32_t i = 0; i < _M; i++) {
+          node_id_t w = links[i];
+          if (w < _cur_num_nodes && dist[w] == 255) { dist[w] = h + 1; next.push_back(w); }
+        }
+      }
+      frontier.swap(next); next.clear(); h++;
+    }
+    return dist;
+  }
+
+  void setHubNodeFlags(const std::vector<uint32_t>& hub_nodes) {
+      for (const auto& hub_node: hub_nodes) {
+        _hub_nodes[hub_node] = true;  
+      }
+  }
+
+  std::vector<std::vector<bool>> getVisitedNodesSequence() {
+    return _visited_nodes_sequence;
   }
 
 #ifdef FLATNAV_CXL_OFFLOAD
-  void connectToDistanceServer(const std::string &shm_name, uint32_t slot_id = 0) {
-    _cxl_client = std::make_unique<flatnav::util::CxlClient>(shm_name, slot_id);
-    if (!_cxl_client->connect()) {
-      throw std::runtime_error("Failed to connect to distance server at '" + shm_name + "'");
-    }
+  // Records the distance server's shared-memory segment name. Actual
+  // connections happen lazily, per calling thread, in cxlClient() -- this
+  // just makes the name available to that lazy path.
+  void connectToDistanceServer(const std::string &shm_name) {
+    _cxl_shm_name = shm_name;
   }
 
+  // Per-thread CxlClients live in thread_local storage and are torn down
+  // automatically when their owning thread exits, so there is nothing to
+  // release here beyond asking the server to stop and preventing further
+  // lazy connects.
   void disconnectFromDistanceServer() {
-    if (_cxl_client) {
-      _cxl_client->sendShutdown();
-      _cxl_client->disconnect();
-      _cxl_client.reset();
+    if (!_cxl_shm_name.empty()) {
+      flatnav::util::CxlClient shutdown_client(_cxl_shm_name, /* slot_id = */ 0);
+      if (shutdown_client.connect()) {
+        shutdown_client.sendShutdown();
+        shutdown_client.disconnect();
+      }
     }
+    _cxl_shm_name.clear();
   }
 
 private:
+  // One CxlClient per OS thread, bound to a distinct server slot. This is
+  // what lets executeInParallel / executeInParallelPinned run several
+  // concurrent search threads that each talk to the distance server over
+  // their own IPC channel instead of contending on a single shared one.
+  // NOTE: assumes a single live Index per process (matches the rest of the
+  // CXL-offload design, e.g. distance_server.cpp / hbw_search.cpp).
+  static inline thread_local std::unique_ptr<flatnav::util::CxlClient> _cxl_client_tl;
   static inline thread_local uint64_t _cxl_active_query_id = 0;
+
+  flatnav::util::CxlClient &cxlClient() {
+    if (!_cxl_client_tl) {
+      // _num_threads is the upper bound on how many threads any single
+      // parallel search call spawns (see setNumThreads); it must also be
+      // <= the distance server's --threads count, or two threads could be
+      // handed the same slot and corrupt each other's IPC requests.
+      uint32_t slot_id = _cxl_next_slot.fetch_add(1, std::memory_order_relaxed) % _num_threads;
+      _cxl_client_tl = std::make_unique<flatnav::util::CxlClient>(_cxl_shm_name, slot_id);
+      if (!_cxl_client_tl->connect()) {
+        throw std::runtime_error("Failed to connect to distance server at '" +
+                                 _cxl_shm_name + "' (slot " + std::to_string(slot_id) + ")");
+      }
+    }
+    return *_cxl_client_tl;
+  }
 
   float computeDistanceCxl(uint32_t node_id) {
     float result = 0.0f;
-    if (!_cxl_client->computeDistances(_cxl_active_query_id, &node_id, 1, &result)) {
+    if (!cxlClient().computeDistances(_cxl_active_query_id, &node_id, 1, &result)) {
       throw std::runtime_error("CXL distance computation failed for node " + std::to_string(node_id));
     }
     return result;
@@ -288,7 +606,10 @@ public:
   std::vector<std::vector<uint32_t>> getGraphOutdegreeTable() {
     std::vector<std::vector<uint32_t>> outdegree_table(_cur_num_nodes);
     for (node_id_t node = 0; node < _cur_num_nodes; node++) {
-      node_id_t* links = getNodeLinks(node);
+      // allocate a vector of size 0 so that each node has an entry in the
+      // outdegree table.
+      outdegree_table[node] = std::vector<uint32_t>();
+      node_id_t *links = getNodeLinks(node);
       for (int i = 0; i < _M; i++) {
         if (links[i] != node) {
           outdegree_table[node].push_back(links[i]);
@@ -296,6 +617,13 @@ public:
       }
     }
     return outdegree_table;
+  }
+
+  size_t cantorPairing(node_id_t a, node_id_t b) {
+    // if (a > b) {
+    //   std::swap(a, b);
+    // }
+    return (a + b) * (a + b + 1) / 2 + b;
   }
 
   /**
@@ -407,7 +735,7 @@ public:
           "create a larger index.");
     }
     std::unique_lock<std::mutex> global_lock(_index_data_guard);
-    auto [entry_node, _init_dist] = initializeSearch(data, num_initializations);
+    auto entry_node = initializeSearch(data, num_initializations);
     node_id_t new_node_id;
     allocateNode(data, label, new_node_id);
     global_lock.unlock();
@@ -416,7 +744,7 @@ public:
       return;
     }
 
-    auto neighbors = beamSearch(
+    auto neighbors = beamSearch<false>(
         /* query = */ data, /* entry_node = */ entry_node,
         /* buffer_size = */ ef_construction);
 
@@ -437,340 +765,43 @@ public:
 #ifdef FLATNAV_CXL_OFFLOAD
     uint64_t curr_query_id = _cxl_query_id_counter.fetch_add(1);
     _cxl_active_query_id = curr_query_id;
-    _cxl_client->cacheQuery(curr_query_id,
-                            static_cast<const float *>(query), _distance->dimension());
+    cxlClient().cacheQuery(curr_query_id,
+                           static_cast<const float *>(query), _distance->dimension());
 #endif
 
-    auto [entry_node, _init_dist] = initializeSearch(query, num_initializations);
-    PriorityQueue neighbors = beamSearch(/* query = */ query,
-                                         /* entry_node = */ entry_node,
-                                         /* buffer_size = */ std::max(ef_search, K));
-                                         
-    flatnav::profiling::dump("my_query");
-    
-    while (neighbors.size() > static_cast<size_t>(K)) {
+    node_id_t entry_node;
+    if (_fixed_entry_node >= 0) {
+      entry_node = static_cast<node_id_t>(_fixed_entry_node);
+    } else if (_use_random_initialization) {
+      entry_node = randomlyInitializeSearch(query, num_initializations);
+    } else {
+      entry_node = initializeSearch(query, num_initializations);
+    }
+    PriorityQueue neighbors =
+        beamSearch<true>(/* query = */ query,
+                         /* entry_node = */ entry_node,
+                         /* buffer_size = */ std::max(K, ef_search));
+    auto size = neighbors.size();
+    std::vector<dist_label_t> results;
+    results.reserve(size);
+    while (!neighbors.empty()) {
+      auto [distance, node_id] = neighbors.top();
+      auto label = *getNodeLabel(node_id);
+      results.emplace_back(distance, label);
       neighbors.pop();
     }
-
-    auto result_size = neighbors.size();
-    std::vector<dist_label_t> results(result_size);
-
-    for (size_t i = result_size; i-- > 0;) {
-      auto [dist, node_id] = neighbors.top();
-      results[i] = {dist, *(getNodeLabel(node_id))};
-      neighbors.pop();
+    std::sort(results.begin(), results.end(),
+              [](const dist_label_t& left, const dist_label_t& right) { return left.first < right.first; });
+    if (results.size() > static_cast<size_t>(K)) {
+      results.resize(K);
     }
-
-    flatnav::profiling::reset();
 
 #ifdef FLATNAV_CXL_OFFLOAD
-    _cxl_client->evictQuery(curr_query_id);
+  cxlClient().evictQuery(curr_query_id);
 #endif
-
     return results;
   }
 
-  std::vector<std::vector<dist_label_t>> concurrentBatchSearch(const void * queries,
-      size_t num_queries, int K, int ef_search,
-      int num_initializations = 100,
-      uint32_t concurrency = 4) {
-
-    if (concurrency == 0) {
-      throw std::invalid_argument("concurrency must be greater than 0.");
-    }
-
-    std::vector<std::vector<dist_label_t>> all_results(num_queries);
-    const size_t buffer_size = static_cast<size_t>(std::max(ef_search, K));
-    const size_t actual_concurrency = std::min(concurrency, static_cast<uint32_t>(num_queries));
-    std::vector<Qstate> states(actual_concurrency);
-
-    // We need to track the idx of the query each slot is working on
-    std::vector<size_t> slot_query_idx(actual_concurrency);
-    size_t next_query = actual_concurrency;
-
-    for(size_t q = 0; q < actual_concurrency; q++) {
-      slot_query_idx[q] = q;
-      states[q].query = static_cast<const char*>(queries) + q * _data_size_bytes;
-    }
-
-    auto init_results = interleavedInitializeSearch(states, num_initializations);
-
-    for (size_t q = 0; q < actual_concurrency; q++) {
-      seedBeamSearchState(states[q], init_results[q], buffer_size);
-    }
-
-    size_t active_count = actual_concurrency;
-
-    while(active_count > 0){
-      for (size_t q = 0; q < actual_concurrency; q++){
-        auto &s = states[q];
-        if(s.execution_state == QueryExecutionState::Done) continue;
-
-        switch (s.execution_state){
-          case QueryExecutionState::Unscheduled: {
-            popCandidateOrFinish(
-              s, K, buffer_size, num_initializations, queries,
-              num_queries, next_query, slot_query_idx[q],
-              all_results, active_count);
-            break;
-          }
-          case QueryExecutionState::ProcessingLinks: {
-            FN_PHASE_BEGIN(Node);
-            processOneLink(s, buffer_size);
-            FN_PHASE_END(Node);
-            break;
-          }
-          case QueryExecutionState::Done:
-            break;
-        }
-      }
-    }
-
-    flatnav::profiling::dump("my_query");
-    flatnav::profiling::reset();
-
-    return all_results;
-  }
-
-  std::vector<std::pair<node_id_t, float>> interleavedInitializeSearch(
-      const std::vector<Qstate> &states, int num_initializations) {
-
-    if (num_initializations <= 0) {
-      throw std::invalid_argument("num_initializations must be greater than 0.");
-    }
-    
-    int step_size = _cur_num_nodes / num_initializations;
-    step_size = std::max(step_size, 1);
-
-    const size_t num_queries = states.size();
-    struct InitState {
-      node_id_t current_node = 0;
-      node_id_t best_node = 0;
-      float min_dist = std::numeric_limits<float>::max();
-      bool done = false;
-    };
-
-    std::vector<InitState> init_states(num_queries);
-
-    if(_collect_stats) {
-      _distance_computations.fetch_add(
-        static_cast<uint64_t>(num_initializations) * num_queries
-      );
-    }
-
-    FN_PHASE_BEGIN(Initialize);
-    size_t queries_remaning = num_queries;
-    while(queries_remaning > 0) {
-      for(size_t q = 0; q < num_queries; q++) {
-        auto &is = init_states[q];
-        if(is.done) continue;
-
-#ifdef FLATNAV_CXL_OFFLOAD
-        float dist = computeDistanceCxl(is.current_node);
-#else
-        float dist = _distance->distance(states[q].query,
-          getNodeData(is.current_node), true);
-#endif
-
-        if (dist < is.min_dist) {
-          is.min_dist = dist;
-          is.best_node = is.current_node;
-        }
-
-        is.current_node += step_size;
-
-        if (is.current_node >= _cur_num_nodes) {
-          is.done = true;
-          queries_remaning--;
-        } else {
-#ifdef USE_SSE
-          _mm_prefetch(getNodeData(is.current_node), _MM_HINT_T0);
-#endif
-        }
-      }
-    }
-    FN_PHASE_END(Initialize);
-
-    std::vector<std::pair<node_id_t, float>> results(num_queries);
-    for(size_t q = 0; q < num_queries; q++) {
-      results[q] = {init_states[q].best_node, init_states[q].min_dist};
-    }
-
-    return results;
-  }
-
-  void seedBeamSearchState(Qstate& s, const std::pair<node_id_t, float>& entry, size_t buffer_size) {
-    auto [entry_node, entry_dist] = entry;
-
-    s.visited = _visited_set_pool->pollAvailableSet();
-    s.visited->clear();  // Clear stale entries from previous query
-    s.visited->insert(entry_node);
-
-    s.max_dist = entry_dist;
-
-    s.candidates.clear();
-    s.candidates.emplace_back(-entry_dist, entry_node);
-    std::push_heap(s.candidates.begin(), s.candidates.end(), cmp);
-
-    s.neighbors.clear();
-    s.neighbors.reserve(buffer_size);
-    s.neighbors.emplace_back(entry_dist, entry_node);
-    std::push_heap(s.neighbors.begin(), s.neighbors.end(), cmp);
-
-
-    s.current_links = nullptr;
-    s.link_idx = 0;
-    s.execution_state = QueryExecutionState::Unscheduled;
-  }
-
-  void finishQuery(Qstate& s, int K, std::vector<dist_label_t>& results) {
-    s.execution_state = QueryExecutionState::Done;
-    while (s.neighbors.size() > static_cast<size_t>(K)) {
-      std::pop_heap(s.neighbors.begin(), s.neighbors.end(), cmp);
-      s.neighbors.pop_back();
-    }
-
-    size_t result_size = s.neighbors.size();
-    results.resize(result_size);
-
-    for (size_t i = result_size; i-- > 0;) {
-      auto [dist, node_id] = s.neighbors.front();
-      std::pop_heap(s.neighbors.begin(), s.neighbors.end(), cmp);
-      s.neighbors.pop_back();
-      results[i] = {dist, *(getNodeLabel(node_id))};
-    }
-  }
-
-  inline void setSearchConcurrency(uint32_t concurrency) {
-    if (concurrency == 0) {
-      throw std::invalid_argument(
-        "Search concurrency must be greater than 0");
-    }
-    _search_concurrency = concurrency;
-  }
-
-  bool popCandidateOrFinish(Qstate& s, int K, size_t buffer_size,
-                            int num_initializations, const void* queries,
-                            size_t num_queries, size_t& next_query,
-                            size_t& slot_query_idx,
-                            std::vector<std::vector<dist_label_t>>& all_results,
-                            size_t& active_count) {
-    
-    // No candidates left to explore, search is done here
-    if(s.candidates.empty()) {
-      return replaceSlot(s, K, buffer_size, num_initializations, queries,
-        num_queries, next_query, slot_query_idx, all_results, active_count);
-    }
-
-    FN_PHASE_BEGIN(Select);
-    auto [neg_dist, node_id] = s.candidates.front();
-    std::pop_heap(s.candidates.begin(), s.candidates.end(), cmp);
-    s.candidates.pop_back();
-    FN_PHASE_END(Select);
-
-
-    // We ain't finding anything better, finish the search for this query
-    if (-neg_dist > s.max_dist && s.neighbors.size() >= buffer_size) {
-      return replaceSlot(s, K, buffer_size, num_initializations, queries,
-        num_queries, next_query, slot_query_idx, all_results, active_count);
-    }
-
-    s.current_links = getNodeLinks(node_id);
-    s.execution_state = QueryExecutionState::ProcessingLinks;
-    s.link_idx = 0;
-
-#ifdef USE_SSE
-    _mm_prefetch(getNodeData(s.current_links[0]), _MM_HINT_T0);
-#endif
-
-    return false;
-  }
-
-  bool replaceSlot(Qstate& s, int K, size_t buffer_size,
-                   int num_initializations, const void* queries,
-                   size_t num_queries, size_t& next_query,
-                   size_t& slot_query_idx,
-                   std::vector<std::vector<dist_label_t>>& all_results,
-                   size_t& active_count) {
-    finishQuery(s, K, all_results[slot_query_idx]);
-
-    flatnav::profiling::dump("my_query");
-    flatnav::profiling::reset();
-
-    if (next_query >= num_queries) {
-      active_count--;
-      return false;
-    }
-
-    slot_query_idx = next_query;
-    next_query++;
-
-    _visited_set_pool->pushVisitedSet(
-        /* visited_set = */ s.visited);
-    s.query = static_cast<const char*>(queries) + slot_query_idx * _data_size_bytes;
-    FN_PHASE_BEGIN(Initialize);
-    auto init_result = initializeSearch(s.query, num_initializations);
-    seedBeamSearchState(s, init_result, buffer_size);
-    FN_PHASE_END(Initialize);
-    return true;
-  }
-
-  void processOneLink(Qstate& s, size_t buffer_size) {
-
-    while (s.link_idx < _M) {
-      node_id_t neighbor_id = s.current_links[s.link_idx];
-      s.link_idx++;
-
-#ifdef USE_SSE
-    if (s.link_idx < _M) {
-      _mm_prefetch(getNodeData(s.current_links[s.link_idx]), _MM_HINT_T0);
-      s.visited->prefetch(s.current_links[s.link_idx]);
-    }
-#endif
-
-      if(s.visited->isVisited(neighbor_id)) continue;
-      s.visited->insert(neighbor_id);
-
-      FN_PHASE_BEGIN(Dist);
-#ifdef FLATNAV_CXL_OFFLOAD
-      float dist = computeDistanceCxl(neighbor_id);
-#else
-      float dist = _distance->distance(s.query, getNodeData(neighbor_id), true);
-#endif
-      FN_PHASE_END(Dist);
-      if (_collect_stats) {
-        _distance_computations.fetch_add(1);
-      }
-
-      FN_PHASE_BEGIN(CI);
-      if (s.neighbors.size() < buffer_size || dist < s.max_dist) {
-        s.candidates.emplace_back(-dist, neighbor_id);
-        std::push_heap(s.candidates.begin(), s.candidates.end(), cmp);
-
-        s.neighbors.emplace_back(dist, neighbor_id);
-        std::push_heap(s.neighbors.begin(), s.neighbors.end(), cmp);
-
-        if (s.neighbors.size() > buffer_size) {
-          std::pop_heap(s.neighbors.begin(), s.neighbors.end(), cmp);
-          s.neighbors.pop_back();
-        }
-        if (!s.neighbors.empty()) {
-          s.max_dist = s.neighbors.front().first;
-        }
-      }
-      FN_PHASE_END(CI);
-
-      break; // yield
-    }
-
-    if (s.link_idx >= _M) {
-      s.execution_state = QueryExecutionState::Unscheduled;
-    }
-  }
-
-  inline uint32_t getSearchConcurrency() const {
-    return _search_concurrency;
-  }
 
   void doGraphReordering(const std::vector<std::string>& reordering_methods) {
 
@@ -802,7 +833,18 @@ public:
     relabel(P);
   }
 
-  static std::unique_ptr<Index<dist_t, label_t>> loadIndex(const std::string& filename) {
+  // NUMA placement (vectors_numa_node, graph_numa_node) lets the caller bind each
+  // storage region to a specific NUMA node at load time (caching study: hot graph
+  // links on the local node, vectors on the remote node). kNoNumaNode = default
+  // allocator. Requires building with FLATNAV_USE_NUMA.
+  // `cxl_shm_name` is only used in FLATNAV_CXL_OFFLOAD builds: it is the
+  // distance server's shared-memory segment name that every search thread's
+  // lazily-created CxlClient (see cxlClient()) will connect to.
+  static std::unique_ptr<Index<dist_t, label_t>> loadIndex(
+      const std::string& filename,
+      int vectors_numa_node = util::kNoNumaNode,
+      int graph_numa_node = util::kNoNumaNode,
+      const std::string& cxl_shm_name = "/flatnav_cxl") {
     std::ifstream stream(filename, std::ios::binary);
 
     if (!stream.is_open()) {
@@ -815,13 +857,13 @@ public:
     std::unique_ptr<DistanceInterface<dist_t>> dist = std::make_unique<dist_t>();
 
     // 1. Deserialize metadata
-    archive(index->_data_type, 
-            index->_M, 
-            index->_data_size_bytes, 
-            index->_node_size_bytes, 
+    archive(index->_data_type,
+            index->_M,
+            index->_data_size_bytes,
+            index->_node_size_bytes,
             index->_graph_node_size_bytes,
             index->_max_node_count,
-            index->_cur_num_nodes, 
+            index->_cur_num_nodes,
             *dist
     );
     index->_visited_set_pool = new VisitedSetPool(
@@ -831,13 +873,37 @@ public:
     index->_num_threads = std::max((uint32_t)1, (uint32_t)std::thread::hardware_concurrency() / 2);
     index->_node_links_mutexes = std::vector<std::mutex>(index->_max_node_count);
 
-    // 2. Allocate memory using deserialized metadata
-    uint64_t mem_size = static_cast<uint64_t>(index->_node_size_bytes) * static_cast<uint64_t>(index->_max_node_count);
+    // Hub-node flags are not serialized; a loaded index starts with no hubs
+    // marked (matching a freshly constructed index before setHubNodeFlags).
+    index->_hub_nodes = new bool[index->_max_node_count];
+    std::fill_n(index->_hub_nodes, index->_max_node_count, false);
 
-    index->_index_memory = new char[mem_size];
+    // 2. Allocate the two storage regions using deserialized metadata. NUMA
+    // placement is not persisted; the caller may bind each region via the
+    // loadIndex(filename, vectors_node, graph_node) overload.
+    index->_vectors_numa_node = vectors_numa_node;
+    index->_graph_numa_node = graph_numa_node;
+    index->_graph_memory =
+        util::allocateBytes(index->graphMemoryBytes(), index->_graph_numa_node);
 
-    // 3. Deserialize content into allocated memory
-    archive(cereal::binary_data(index->_index_memory, mem_size));
+#ifdef FLATNAV_CXL_OFFLOAD
+    // Vectors are served by the distance server (search() offloads every
+    // distance computation to it via computeDistanceCxl), so there is no
+    // need to allocate or load them locally. We still have to skip past
+    // their serialized bytes so the graph region below is read from the
+    // right file offset -- cereal's binary_data is a plain byte range with
+    // no length prefix, so seeking past it on the underlying stream is safe.
+    index->_vectors_memory = nullptr;
+    stream.seekg(static_cast<std::streamoff>(index->vectorsMemoryBytes()), std::ios::cur);
+    index->connectToDistanceServer(cxl_shm_name);
+#else
+    index->_vectors_memory =
+        util::allocateBytes(index->vectorsMemoryBytes(), index->_vectors_numa_node);
+    archive(cereal::binary_data(index->_vectors_memory, index->vectorsMemoryBytes()));
+#endif
+
+    // 3. Deserialize the graph region.
+    archive(cereal::binary_data(index->_graph_memory, index->graphMemoryBytes()));
 
     return index;
   }
@@ -869,6 +935,16 @@ public:
   inline uint64_t getTotalIndexMemory() const {
     return static_cast<uint64_t>(_node_size_bytes) * static_cast<uint64_t>(_max_node_count);
   }
+
+  // Byte size of the vectors region ([data] per node).
+  inline uint64_t vectorsMemoryBytes() const {
+    return static_cast<uint64_t>(_data_size_bytes) * static_cast<uint64_t>(_max_node_count);
+  }
+
+  // Byte size of the graph region ([M links][label] per node).
+  inline uint64_t graphMemoryBytes() const {
+    return static_cast<uint64_t>(_graph_node_size_bytes) * static_cast<uint64_t>(_max_node_count);
+  }
   inline uint64_t mutexesAllocatedMemory() const {
     return static_cast<uint64_t>(_node_links_mutexes.size() * sizeof(std::mutex));
   }
@@ -890,11 +966,10 @@ public:
   inline size_t currentNumNodes() const { return _cur_num_nodes; }
   inline size_t dataDimension() const { return _distance->dimension(); }
 
-  /// Returns a pointer to the raw vector data for node `n`.
-  inline const char* getNodeDataPublic(uint32_t n) const {
-    uint64_t byte_offset = static_cast<uint64_t>(n) * static_cast<uint64_t>(_node_size_bytes);
-    return _index_memory + byte_offset;
-  }
+  // Region pointers + graph stride — for external NUMA tiering (mbind) after relabel.
+  inline char* vectorsMemory() const { return _vectors_memory; }
+  inline char* graphMemory() const { return _graph_memory; }
+  inline size_t graphNodeSizeBytes() const { return _graph_node_size_bytes; }
 
   inline uint64_t distanceComputations() const { return _distance_computations.load(); }
 
@@ -905,13 +980,18 @@ public:
     _metric_hops = 0;
   }
 
+  // Return a reference to the node access counts
+  inline const std::unordered_map<uint32_t, uint32_t> &
+  getNodeAccessCounts() const {
+    return _node_access_counts;
+  }
+
   void getIndexSummary() const {
     std::cout << "\nIndex Parameters\n" << std::flush;
     std::cout << "-----------------------------\n" << std::flush;
     std::cout << "max_edges_per_node (M): " << _M << "\n" << std::flush;
     std::cout << "data_size_bytes: " << _data_size_bytes << "\n" << std::flush;
     std::cout << "node_size_bytes: " << _node_size_bytes << "\n" << std::flush;
-    std::cout << "graph_node_size_bytes: " << _graph_node_size_bytes << "\n" << std::flush;
     std::cout << "max_node_count: " << _max_node_count << "\n" << std::flush;
     std::cout << "cur_num_nodes: " << _cur_num_nodes << "\n" << std::flush;
 
@@ -924,22 +1004,20 @@ public:
   Index() = default;
 
   char* getNodeData(const node_id_t& n) const {
-    uint64_t byte_offset = static_cast<uint64_t>(n) * static_cast<uint64_t>(_node_size_bytes);
-    return _index_memory + byte_offset;
+    uint64_t byte_offset = static_cast<uint64_t>(n) * static_cast<uint64_t>(_data_size_bytes);
+    return _vectors_memory + byte_offset;
   }
 
   node_id_t* getNodeLinks(const node_id_t& n) const {
-    uint64_t byte_offset = static_cast<uint64_t>(n) * static_cast<uint64_t>(_node_size_bytes);
-    byte_offset += _data_size_bytes;
-    char* location = _index_memory + byte_offset;
+    uint64_t byte_offset = static_cast<uint64_t>(n) * static_cast<uint64_t>(_graph_node_size_bytes);
+    char* location = _graph_memory + byte_offset;
     return reinterpret_cast<node_id_t*>(location);
   }
 
   label_t* getNodeLabel(const node_id_t& n) const {
-    uint64_t byte_offset = static_cast<uint64_t>(n) * static_cast<uint64_t>(_node_size_bytes);
-    byte_offset += _data_size_bytes;
+    uint64_t byte_offset = static_cast<uint64_t>(n) * static_cast<uint64_t>(_graph_node_size_bytes);
     byte_offset += (_M * sizeof(node_id_t));
-    char* location = _index_memory + byte_offset;
+    char* location = _graph_memory + byte_offset;
     return reinterpret_cast<label_t*>(location);
   }
 
@@ -973,53 +1051,104 @@ public:
    *
    * @return PriorityQueue
    */
-
-  PriorityQueue beamSearch(const void* query, const node_id_t entry_node, 
-          const int buffer_size) {
+  template <bool is_search_stage = false>
+  PriorityQueue beamSearch(const void *query, const node_id_t entry_node,
+                           const int buffer_size) {
     PriorityQueue neighbors;
+    PriorityQueue candidates;
 
-    thread_local std::vector<dist_node_t> candidates;
-    candidates.clear();
+    // Keep track of the nodes visited during the search.
+    // Add True if the node is a hub node, else False.
+    std::vector<bool> query_visited_nodes_flags;
 
-    auto* visited_set = _visited_set_pool->pollAvailableSet();
+    auto *visited_set = _visited_set_pool->pollAvailableSet();
     visited_set->clear();
 
-    // Prefetch the data for entry node before computing its distance.
-#ifdef USE_SSE
+    // Prefetch the data for entry node before computing its distance. Skipped
+    // under CXL offload: there is no local vector memory to prefetch there.
+#if defined(USE_SSE) && !defined(FLATNAV_DISABLE_PREFETCH) && !defined(FLATNAV_CXL_OFFLOAD)
     _mm_prefetch(getNodeData(entry_node), _MM_HINT_T0);
 #endif
 
-    // // Dereference data to ensure it's loaded into cache before timing Dist phase
-    // volatile float* entry_data_ptr = (float*)getNodeData(entry_node);
-    // volatile float ignored_val = entry_data_ptr[0];
-    // (void)ignored_val;  // Suppress unused warning
-    
-    FN_PHASE_BEGIN(Initialize);
 #ifdef FLATNAV_CXL_OFFLOAD
     float dist = computeDistanceCxl(entry_node);
 #else
     float dist = _distance->distance(/* x = */ query, /* y = */ getNodeData(entry_node),
                                      /* asymmetric = */ true);
 #endif
-    FN_PHASE_END(Initialize);
+
+#ifdef FLATNAV_PROFILE_VISITS
+    if (_node_data_counts) _node_data_counts[entry_node].fetch_add(1, std::memory_order_relaxed);
+#endif
 
     float max_dist = dist;
-    candidates.emplace_back(-dist, entry_node);
-    std::push_heap(candidates.begin(), candidates.end(), cmp);
+    candidates.emplace(-dist, entry_node);
     neighbors.emplace(dist, entry_node);
+    query_visited_nodes_flags.push_back(_hub_nodes[entry_node]);
     visited_set->insert(entry_node);
+#ifdef FLATNAV_PROFILE_PQ
+    tl_disc.clear(); tl_parent_res.clear(); tl_step = 0; tl_cur_residency = 0;
+    tl_disc[entry_node] = 0; tl_parent_res[entry_node] = 0;
+    tl_pf.clear();
+    tl_pf1_valid = false;
+#endif
 
     while (!candidates.empty()) {
-      FN_PHASE_BEGIN(Select);
-      auto [distance, node] = candidates.front();
+      auto [distance, node] = candidates.top();
 
       if (-distance > max_dist && neighbors.size() >= buffer_size) {
-        FN_PHASE_END(Select);
         break;
       }
-      std::pop_heap(candidates.begin(), candidates.end(), cmp);
-      candidates.pop_back();
-      FN_PHASE_END(Select);
+      candidates.pop();
+#ifdef FLATNAV_PROFILE_PQ
+      // Residency of the node being expanded = tl_step (its pop step) - its discovery step.
+      // tl_step is NOT incremented until after the expansion, so neighbors discovered below
+      // are tagged with this node's pop step.
+      {
+        auto it = tl_disc.find(node);
+        uint32_t res = tl_step - (it != tl_disc.end() ? it->second : tl_step);
+        g_pq_residency_hist[res < kPQHistCap ? res : kPQHistCap - 1].fetch_add(1, std::memory_order_relaxed);
+        // per-step (pop index) buckets for the early/late split
+        uint32_t sidx = tl_step < kPQStepCap ? tl_step : kPQStepCap - 1;
+        g_step_count[sidx].fetch_add(1, std::memory_order_relaxed);
+        g_step_sumres[sidx].fetch_add(res, std::memory_order_relaxed);
+        if (res == 1) g_step_leap[sidx].fetch_add(1, std::memory_order_relaxed);
+        tl_cur_residency = res;            // neighbors discovered now inherit this as parent residency
+        if (res == 1) {                    // leapfrogger (res 0 = entry node): how much lead did its parent give?
+          auto pit = tl_parent_res.find(node);
+          uint32_t pr = (pit != tl_parent_res.end()) ? pit->second : 0;
+          g_leapfrog_parent_hist[pr < kPQHistCap ? pr : kPQHistCap - 1].fetch_add(1, std::memory_order_relaxed);
+        }
+        // top-K prefetch policy: mark this node as popped (a prefetch "success").
+        { auto& e = tl_pf[node]; e.popped = true; e.pop_step = (uint16_t)tl_step; }
+        // top-K prefetch policy: snapshot the K closest pending candidates NOW -- just after the
+        // pop, before processCandidateNode discovers this node's neighbors -- so this step's
+        // leapfroggers are excluded from every K. Record each node's first-prefetch step. tl_step
+        // is still this step.
+        {
+          PriorityQueue tmp = candidates;  // copy; pop to read closest-first
+          int maxK = kPFK[kPFnumK - 1];
+          for (int r = 1; r <= maxK && !tmp.empty(); ++r) {
+            node_id_t x = tmp.top().second; tmp.pop();
+            auto& e = tl_pf[x];
+            for (int ki = 0; ki < kPFnumK; ++ki)
+              if (r <= kPFK[ki] && e.fe[ki] == 0xFFFF) e.fe[ki] = (uint16_t)tl_step;
+          }
+        }
+        // pre-expansion K=1 NEXT-STEP precision: did last step's prefetched 2nd-min == the node
+        // popped now? (i.e. used at the immediately next step). Then record this step's 2nd-min.
+        if (tl_pf1_valid) {
+          uint32_t b = tl_pf1_step < kPQStepCap ? tl_pf1_step : kPQStepCap - 1;
+          g_pf1_next_total[b].fetch_add(1, std::memory_order_relaxed);
+          if (node == tl_pf1_node) g_pf1_next_hit[b].fetch_add(1, std::memory_order_relaxed);
+        }
+        if (!candidates.empty()) {
+          tl_pf1_node = candidates.top().second; tl_pf1_step = tl_step; tl_pf1_valid = true;
+        } else {
+          tl_pf1_valid = false;  // nothing left to prefetch this step
+        }
+      }
+#endif
 
       // Prefetching the next candidate node data and visited set marker
       // before processing it. Note that this might not be useful if the current
@@ -1027,21 +1156,46 @@ public:
       // distance. In that case we would have prefetched data that is not used
       // immediately, but I think the cost of prefetching is low enough that
       // it's probably worth it.
-#ifdef USE_SSE
+#if defined(USE_SSE) && !defined(FLATNAV_DISABLE_PREFETCH)
       if (!candidates.empty()) {
-        _mm_prefetch(getNodeData(candidates.front().second), _MM_HINT_T0);
-        visited_set->prefetch(candidates.front().second);
+#ifndef FLATNAV_CXL_OFFLOAD
+        _mm_prefetch(getNodeData(candidates.top().second), _MM_HINT_T0);
+#endif
+        visited_set->prefetch(candidates.top().second);
       }
 #endif
 
-      FN_PHASE_BEGIN(Node);
-      processCandidateNode(
+      processCandidateNode<is_search_stage>(
           /* query = */ query, /* node = */ node,
           /* max_dist = */ max_dist, /* buffer_size = */ buffer_size,
           /* visited_set = */ visited_set,
-          /* neighbors = */ neighbors, /* candidates = */ candidates);
-      FN_PHASE_END(Node);
+          /* neighbors = */ neighbors, /* candidates = */ candidates,
+          /* query_visited_nodes = */ query_visited_nodes_flags);
+#ifdef FLATNAV_PROFILE_PQ
+      tl_step++;  // advance the step counter after the expansion completes
+#endif
     }
+#ifdef FLATNAV_PROFILE_PQ
+    // Terminal: the 2nd-min prefetched at the final step has no "next step" (search ended) -> miss.
+    if (tl_pf1_valid) {
+      uint32_t b = tl_pf1_step < kPQStepCap ? tl_pf1_step : kPQStepCap - 1;
+      g_pf1_next_total[b].fetch_add(1, std::memory_order_relaxed);
+    }
+    // End of query: tally each prefetched node as success (popped) or waste (never popped),
+    // bucketed by its first-prefetch step, for every K.
+    for (auto& kv : tl_pf) {
+      PFEntry& e = kv.second;
+      for (int ki = 0; ki < kPFnumK; ++ki) {
+        if (e.fe[ki] == 0xFFFF) continue;
+        uint32_t s = e.fe[ki] < kPQStepCap ? e.fe[ki] : kPQStepCap - 1;
+        g_pf_prefetched[ki][s].fetch_add(1, std::memory_order_relaxed);
+        if (e.popped) {
+          g_pf_success[ki][s].fetch_add(1, std::memory_order_relaxed);
+          g_pf_leadsum[ki].fetch_add((uint32_t)(e.pop_step - e.fe[ki]), std::memory_order_relaxed);
+        }
+      }
+    }
+#endif
 
     _visited_set_pool->pushVisitedSet(
         /* visited_set = */ visited_set);
@@ -1049,20 +1203,39 @@ public:
     return neighbors;
   }
 
-  void processCandidateNode(const void* query, node_id_t& node, float& max_dist, const int buffer_size,
-                            VisitedSet* visited_set, PriorityQueue& neighbors, std::vector<dist_node_t>& candidates) {
-    // Lock all operations on this specific node
-    std::unique_lock<std::mutex> lock(_node_links_mutexes[node]);
+  template <bool is_search_stage>
+#ifdef FLATNAV_PROFILE_NOINLINE
+  __attribute__((noinline))
+#endif
+  void processCandidateNode(const void *query, node_id_t &node, float &max_dist,
+                            const int buffer_size, VisitedSet *visited_set,
+                            PriorityQueue &neighbors,
+                            PriorityQueue &candidates, std::vector<bool>& query_visited_nodes_flags) {
+    // Lock all operations on this specific node. During search the graph is
+    // frozen (read-only), so the per-node lock is pure overhead and is skipped;
+    // it is only needed during construction (is_search_stage == false) to guard
+    // concurrent writers.
+    std::unique_lock<std::mutex> lock(_node_links_mutexes[node], std::defer_lock);
+    if constexpr (!is_search_stage) {
+      lock.lock();
+    }
 
-    node_id_t* neighbor_node_links = getNodeLinks(node);
+    node_id_t *neighbor_node_links = getNodeLinks(node);
+#ifdef FLATNAV_PROFILE_VISITS
+    // Count this node's graph-link access (the tiered/cached quantity).
+    if (_node_visit_counts) _node_visit_counts[node].fetch_add(1, std::memory_order_relaxed);
+#endif
+    query_visited_nodes_flags.push_back(_hub_nodes[node]);
     for (uint32_t i = 0; i < _M; i++) {
       node_id_t neighbor_node_id = neighbor_node_links[i];
 
       // If using SSE, prefetch the next neighbor node data and the visited
       // marker
-#ifdef USE_SSE
+#if defined(USE_SSE) && !defined(FLATNAV_DISABLE_PREFETCH)
       if (i != _M - 1) {
+#ifndef FLATNAV_CXL_OFFLOAD
         _mm_prefetch(getNodeData(neighbor_node_links[i + 1]), _MM_HINT_T0);
+#endif
         visited_set->prefetch(neighbor_node_links[i + 1]);
       }
 #endif
@@ -1073,13 +1246,12 @@ public:
         continue;
       }
       visited_set->insert(/* num = */ neighbor_node_id);
+#ifdef FLATNAV_PROFILE_VISITS
+      // Count this neighbor's DATA (vector) access — the full activated footprint,
+      // a superset of link-expanded nodes (these neighbors may never be expanded).
+      if (_node_data_counts) _node_data_counts[neighbor_node_id].fetch_add(1, std::memory_order_relaxed);
+#endif
 
-      // Dereference data to ensure it's loaded into cache before timing Dist phase
-      // volatile float* neighbor_data_ptr = (float*)getNodeData(neighbor_node_id);
-      // volatile float ignored_val = neighbor_data_ptr[0];
-      // (void)ignored_val;  // Suppress unused warning
-
-      FN_PHASE_BEGIN(Dist);
 #ifdef FLATNAV_CXL_OFFLOAD
       float dist = computeDistanceCxl(neighbor_node_id);
 #else
@@ -1087,19 +1259,22 @@ public:
                                  /* y = */ getNodeData(neighbor_node_id),
                                  /* asymmetric = */ true);
 #endif
-      FN_PHASE_END(Dist);
 
       if (_collect_stats) {
         _distance_computations.fetch_add(1);
       }
 
-      FN_PHASE_BEGIN(CI);
       if (neighbors.size() < buffer_size || dist < max_dist) {
-        candidates.emplace_back(-dist, neighbor_node_id);
-        std::push_heap(candidates.begin(), candidates.end(), cmp);
+        candidates.emplace(-dist, neighbor_node_id);
         neighbors.emplace(dist, neighbor_node_id);
-#ifdef USE_SSE
-        _mm_prefetch(getNodeData(candidates.front().second), _MM_HINT_T0);
+#ifdef FLATNAV_PROFILE_PQ
+        // Node enters the PQ now (discovered during the current expansion).
+        tl_disc[neighbor_node_id] = tl_step;
+        tl_parent_res[neighbor_node_id] = tl_cur_residency;
+#endif
+        // query_visited_nodes_flags.push_back(_hub_nodes[neighbor_node_id]);
+#if defined(USE_SSE) && !defined(FLATNAV_DISABLE_PREFETCH) && !defined(FLATNAV_CXL_OFFLOAD)
+        _mm_prefetch(getNodeData(candidates.top().second), _MM_HINT_T0);
 #endif
         if (neighbors.size() > buffer_size) {
           neighbors.pop();
@@ -1108,7 +1283,6 @@ public:
           max_dist = neighbors.top().first;
         }
       }
-      FN_PHASE_END(CI);
     }
   }
 
@@ -1248,13 +1422,11 @@ public:
    * @param num_initializations
    * @return node_id_t
    */
-  inline std::pair<node_id_t, float> initializeSearch(const void* query, int num_initializations) {
+  inline node_id_t initializeSearch(const void* query, int num_initializations) {
     // select entry_node from a set of random entry point options
     if (num_initializations <= 0) {
       throw std::invalid_argument("num_initializations must be greater than 0.");
     }
-
-    FN_PHASE_BEGIN(Initialize);
 
     int step_size = _cur_num_nodes / num_initializations;
     step_size = step_size ? step_size : 1;
@@ -1267,29 +1439,55 @@ public:
     }
 
     for (node_id_t node = 0; node < _cur_num_nodes; node += step_size) {
-#ifdef USE_SSE
-      node_id_t next_node = node + step_size;
-      if (next_node < _cur_num_nodes) {
-        _mm_prefetch(getNodeData(next_node), _MM_HINT_T0);
-      }
-#endif
 #ifdef FLATNAV_CXL_OFFLOAD
       float dist = computeDistanceCxl(node);
 #else
-      float dist = _distance->distance(/* x = */ query, /* y = */ getNodeData(node),
-                                       /* asymmetric = */ true);
+      float dist = _distance->distance(/* x = */ query,
+                                 /* y = */ getNodeData(node),
+                                 /* asymmetric = */ true);
 #endif
       if (dist < min_dist) {
         min_dist = dist;
         entry_node = node;
       }
     }
-
-    FN_PHASE_END(Initialize);
-    return {entry_node, min_dist};
+    return entry_node;
   }
 
-  void relabel(const std::vector<node_id_t>& P) {
+  // Use this during search to select a random entry point
+  node_id_t randomlyInitializeSearch(const void *query,
+                                     int num_initializations) {
+    // select entry_node from a set of random entry point options
+    if (num_initializations <= 0) {
+      throw std::invalid_argument(
+          "num_initializations must be greater than 0.");
+    }
+
+    float min_dist = std::numeric_limits<float>::max();
+    node_id_t entry_node = 0;
+
+    if (_collect_stats) {
+      _distance_computations.fetch_add(num_initializations);
+    }
+
+    for (int i = 0; i < num_initializations; i++) {
+      node_id_t node = _distribution(_generator);
+#ifdef FLATNAV_CXL_OFFLOAD
+      float dist = computeDistanceCxl(node);
+#else
+      float dist = _distance->distance(/* x = */ query,
+                                 /* y = */ getNodeData(node),
+                                 /* asymmetric = */ true);
+#endif
+      if (dist < min_dist) {
+        min_dist = dist;
+        entry_node = node;
+      }
+    }
+    return entry_node;
+  }
+
+  void relabel(const std::vector<node_id_t> &P) {
     // 1. Rewire all of the node connections
     for (node_id_t n = 0; n < _cur_num_nodes; n++) {
       node_id_t* links = getNodeLinks(n);
@@ -1344,6 +1542,6 @@ public:
     delete[] temp_links;
     delete temp_label;
   }
-};
+}; // namespace flatnav
 
 }  // namespace flatnav
