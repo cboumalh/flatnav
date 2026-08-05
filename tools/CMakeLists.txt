@@ -27,7 +27,7 @@ install(TARGETS distance_server RUNTIME DESTINATION bin)
 # hbw_search only uses libnuma optionally, behind -DFLATNAV_USE_NUMA (see its
 # NumaThreadPool/NumaAllocation usage), so it doesn't link libnuma by default.
 add_executable(hbw_search hbw_search.cpp ${HEADERS})
-# target_compile_definitions(hbw_search PRIVATE FLATNAV_CXL_OFFLOAD)
+target_compile_definitions(hbw_search PRIVATE FLATNAV_CXL_OFFLOAD)
 target_link_libraries(hbw_search FLAT_NAV_LIB Threads::Threads)
 set_target_properties(hbw_search PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                             "${CMAKE_BINARY_DIR}")

@@ -339,8 +339,13 @@ public:
     return waitForResponse(CxlMessageType::Ack);
   }
 
-  bool computeDistances(uint64_t query_id, const uint32_t *node_ids,
-                        uint32_t count, float *out_distances) {
+  // Writes the request and flips the ready flag, then returns immediately
+  // without waiting for a response -- pairs with recvDistanceResponse().
+  // Splitting the send from the wait lets a caller do local work (e.g.
+  // distances it can compute itself) while the server processes this
+  // request, instead of blocking on it right away like computeDistances().
+  bool sendDistanceRequest(uint64_t query_id, const uint32_t *node_ids,
+                           uint32_t count) {
     if (!_connected || _region == nullptr) {
       return false;
     }
@@ -362,7 +367,18 @@ public:
     req_header->payload_size = payload_size;
 
     req_header->ready_flag.store(1, std::memory_order_release);
+    return true;
+  }
 
+  // Blocks until the response to the most recent sendDistanceRequest() on
+  // this slot is ready (or times out). `count` must match the count passed
+  // to that request.
+  bool recvDistanceResponse(uint32_t count, float *out_distances) {
+    if (!_connected || _region == nullptr) {
+      return false;
+    }
+
+    Slot &slot = _region->slots[_slot_id];
     auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
     CxlResponse *resp_header =
@@ -391,6 +407,12 @@ public:
     }
 
     return false;
+  }
+
+  bool computeDistances(uint64_t query_id, const uint32_t *node_ids,
+                        uint32_t count, float *out_distances) {
+    return sendDistanceRequest(query_id, node_ids, count) &&
+           recvDistanceResponse(count, out_distances);
   }
 
   bool sendShutdown() {

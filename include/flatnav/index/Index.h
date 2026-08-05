@@ -179,6 +179,13 @@ class Index {
   std::string _cxl_shm_name;
   std::atomic<uint32_t> _cxl_next_slot{0};
   std::atomic<uint64_t> _cxl_query_id_counter{0};
+
+  // Path + byte offset of the vectors region within the serialized index
+  // file, captured by loadIndex() when vectors are skipped (not resident in
+  // _vectors_memory). Lets cacheHubVectors() fetch individual hub vectors
+  // on demand without keeping the whole vectors block resident on the host.
+  std::string _index_file_path;
+  std::streamoff _vectors_file_offset = 0;
 #endif
 
   // NOTE: These metrics are meaningful the most with single-threaded search.
@@ -196,6 +203,13 @@ class Index {
 
   bool* _hub_nodes = nullptr; // A boolean array to keep track of hub nodes.
   // If a node is a hub, then _hub_nodes[node] = true, else false.
+
+  // CXL-offload hub caching: host-side cache of hub nodes' vector data, so
+  // processCandidateNode can compute their distances locally instead of
+  // round-tripping to the distance server. Parallel to _hub_nodes; entry is
+  // null unless that node is both a hub and has been cached via
+  // cacheHubVectors(). Populated/freed via freeHubVectorCache().
+  char** _hub_vector_cache = nullptr;
 
   // Tracking metrics for node access patterns. This unordered map is used to
   // record how many times each node is visited during search. The key is the
@@ -246,11 +260,13 @@ class Index {
         _num_threads(other._num_threads),
         _visited_set_pool(std::move(other._visited_set_pool)),
         _node_links_mutexes(std::move(other._node_links_mutexes)),
-        _hub_nodes(other._hub_nodes) {
+        _hub_nodes(other._hub_nodes),
+        _hub_vector_cache(other._hub_vector_cache) {
     other._vectors_memory = nullptr;
     other._graph_memory = nullptr;
     other._visited_set_pool = nullptr;
     other._hub_nodes = nullptr;
+    other._hub_vector_cache = nullptr;
   }
 
   Index& operator=(Index&& other) noexcept {
@@ -259,6 +275,7 @@ class Index {
       util::freeBytes(_graph_memory, graphMemoryBytes(), _graph_numa_node);
       delete _visited_set_pool;
       delete[] _hub_nodes;
+      freeHubVectorCache();
 
       _vectors_memory = other._vectors_memory;
       _graph_memory = other._graph_memory;
@@ -275,11 +292,13 @@ class Index {
       _visited_set_pool = std::move(other._visited_set_pool);
       _node_links_mutexes = std::move(other._node_links_mutexes);
       _hub_nodes = other._hub_nodes;
+      _hub_vector_cache = other._hub_vector_cache;
 
       other._vectors_memory = nullptr;
       other._graph_memory = nullptr;
       other._visited_set_pool = nullptr;
       other._hub_nodes = nullptr;
+      other._hub_vector_cache = nullptr;
     }
     return *this;
   }
@@ -363,6 +382,7 @@ class Index {
     delete[] _hub_nodes;
     delete[] _node_visit_counts;
     delete[] _node_data_counts;
+    freeHubVectorCache();
   }
 
   /**
@@ -512,6 +532,36 @@ class Index {
     _cxl_shm_name.clear();
   }
 
+  // Reads and caches every currently-flagged hub node's vector data directly
+  // from the serialized index file, so processCandidateNode can compute
+  // their distances locally instead of paying a CXL round trip for them.
+  // Must be called after loadIndex() (which records _index_file_path and
+  // _vectors_file_offset) and after setHubNodeFlags() has marked the hubs.
+  void cacheHubVectors() {
+    if (_index_file_path.empty()) {
+      throw std::runtime_error(
+          "cacheHubVectors requires an index loaded via loadIndex() under FLATNAV_CXL_OFFLOAD.");
+    }
+
+    std::ifstream stream(_index_file_path, std::ios::binary);
+    if (!stream.is_open()) {
+      throw std::runtime_error("cacheHubVectors: unable to reopen index file: " + _index_file_path);
+    }
+
+    freeHubVectorCache();
+    _hub_vector_cache = new char*[_max_node_count]();
+
+    for (node_id_t node = 0; node < _max_node_count; node++) {
+      if (!_hub_nodes[node]) {
+        continue;
+      }
+      stream.seekg(_vectors_file_offset + static_cast<std::streamoff>(node) * _data_size_bytes);
+      char* buf = new char[_data_size_bytes];
+      stream.read(buf, static_cast<std::streamsize>(_data_size_bytes));
+      _hub_vector_cache[node] = buf;
+    }
+  }
+
 private:
   // One CxlClient per OS thread, bound to a distinct server slot. This is
   // what lets executeInParallel / executeInParallelPinned run several
@@ -565,6 +615,28 @@ private:
         throw std::runtime_error("CXL batch distance computation failed for " +
                                  std::to_string(chunk) + " nodes");
       }
+    }
+  }
+
+  // Send half of computeDistancesCxl's round trip, without waiting for the
+  // response -- pairs with recvDistancesCxl(). Lets processCandidateNode
+  // compute hub-cached distances locally while the server works on this
+  // batch instead of blocking on it immediately. Unlike computeDistancesCxl,
+  // this does not chunk: callers must keep `count` <= 1024 (the wire
+  // protocol's hard limit), which holds for a per-hop neighbor batch since
+  // that's bounded by _M.
+  void sendDistancesCxl(const uint32_t *node_ids, uint32_t count) {
+    if (!cxlClient().sendDistanceRequest(_cxl_active_query_id, node_ids, count)) {
+      throw std::runtime_error("CXL distance request failed to send for " +
+                               std::to_string(count) + " nodes");
+    }
+  }
+
+  // Blocking half of the send/recv split -- see sendDistancesCxl().
+  void recvDistancesCxl(uint32_t count, float *out_distances) {
+    if (!cxlClient().recvDistanceResponse(count, out_distances)) {
+      throw std::runtime_error("CXL distance response failed for " +
+                               std::to_string(count) + " nodes");
     }
   }
 
@@ -915,6 +987,12 @@ public:
     // their serialized bytes so the graph region below is read from the
     // right file offset -- cereal's binary_data is a plain byte range with
     // no length prefix, so seeking past it on the underlying stream is safe.
+    // The stream position right now, before the skip, is exactly where the
+    // vectors region begins -- record it so cacheHubVectors() can later seek
+    // to any individual hub node's vector (offset + node_id * data_size_bytes)
+    // without keeping the whole block resident.
+    index->_index_file_path = filename;
+    index->_vectors_file_offset = stream.tellg();
     index->_vectors_memory = nullptr;
     stream.seekg(static_cast<std::streamoff>(index->vectorsMemoryBytes()), std::ios::cur);
     index->connectToDistanceServer(cxl_shm_name);
@@ -1041,6 +1119,17 @@ public:
     byte_offset += (_M * sizeof(node_id_t));
     char* location = _graph_memory + byte_offset;
     return reinterpret_cast<label_t*>(location);
+  }
+
+  // Releases every cached hub vector buffer plus the cache array itself.
+  void freeHubVectorCache() {
+    if (_hub_vector_cache) {
+      for (size_t i = 0; i < _max_node_count; i++) {
+        delete[] _hub_vector_cache[i];
+      }
+      delete[] _hub_vector_cache;
+      _hub_vector_cache = nullptr;
+    }
   }
 
   inline void swapNodes(node_id_t a, node_id_t b, void* temp_data, node_id_t* temp_links,
@@ -1255,7 +1344,30 @@ public:
     // instead of one round-trip per neighbor (see computeDistancesCxl).
     static thread_local std::vector<node_id_t> tl_cxl_batch_ids;
     static thread_local std::vector<float> tl_cxl_batch_dists;
+    static thread_local std::vector<node_id_t> tl_hub_ids;
     tl_cxl_batch_ids.clear();
+    tl_hub_ids.clear();
+
+    // Shared acceptance logic for a (neighbor, distance) pair, used both for
+    // hub-cache hits (computed inline below, no round trip) and for the
+    // batched CXL response (computed after the loop).
+    auto accept = [&](node_id_t neighbor_node_id, float dist) {
+      if (neighbors.size() < buffer_size || dist < max_dist) {
+        candidates.emplace(-dist, neighbor_node_id);
+        neighbors.emplace(dist, neighbor_node_id);
+#ifdef FLATNAV_PROFILE_PQ
+        // Node enters the PQ now (discovered during the current expansion).
+        tl_disc[neighbor_node_id] = tl_step;
+        tl_parent_res[neighbor_node_id] = tl_cur_residency;
+#endif
+        if (neighbors.size() > buffer_size) {
+          neighbors.pop();
+        }
+        if (!neighbors.empty()) {
+          max_dist = neighbors.top().first;
+        }
+      }
+    };
 #endif
 
     for (uint32_t i = 0; i < _M; i++) {
@@ -1285,7 +1397,15 @@ public:
 #endif
 
 #ifdef FLATNAV_CXL_OFFLOAD
-      tl_cxl_batch_ids.push_back(neighbor_node_id);
+      // Just bucket here -- the hub distances are computed further down,
+      // after the non-hub batch's CXL request has been sent (not yet
+      // waited on), so that local compute overlaps the round trip instead
+      // of happening serially before it.
+      if (_hub_vector_cache && _hub_vector_cache[neighbor_node_id]) {
+        tl_hub_ids.push_back(neighbor_node_id);
+      } else {
+        tl_cxl_batch_ids.push_back(neighbor_node_id);
+      }
 #else
       float dist = _distance->distance(/* x = */ query,
                                  /* y = */ getNodeData(neighbor_node_id),
@@ -1318,35 +1438,47 @@ public:
     }
 
 #ifdef FLATNAV_CXL_OFFLOAD
-    if (!tl_cxl_batch_ids.empty()) {
+    // Fire the non-hub batch request without waiting for the response, so
+    // the hub-vector distances below (pure local compute) overlap with the
+    // server's round trip instead of paying for it serially.
+    bool cxl_pending = !tl_cxl_batch_ids.empty();
+    // sendDistancesCxl/recvDistancesCxl don't chunk (unlike computeDistancesCxl),
+    // so the overlap path only applies within the wire protocol's single-request
+    // limit; an oversized batch (would require max_edges_per_node > 1024, not a
+    // realistic graph config) falls back to the blocking, chunked call instead.
+    bool cxl_async = cxl_pending && tl_cxl_batch_ids.size() <= 1024;
+    if (cxl_pending) {
       tl_cxl_batch_dists.resize(tl_cxl_batch_ids.size());
-      computeDistancesCxl(tl_cxl_batch_ids.data(),
-                          static_cast<uint32_t>(tl_cxl_batch_ids.size()),
-                          tl_cxl_batch_dists.data());
+      if (cxl_async) {
+        sendDistancesCxl(tl_cxl_batch_ids.data(),
+                         static_cast<uint32_t>(tl_cxl_batch_ids.size()));
+      } else {
+        computeDistancesCxl(tl_cxl_batch_ids.data(),
+                            static_cast<uint32_t>(tl_cxl_batch_ids.size()),
+                            tl_cxl_batch_dists.data());
+      }
+    }
 
+    for (node_id_t neighbor_node_id : tl_hub_ids) {
+      float dist = _distance->distance(/* x = */ query,
+                                 /* y = */ _hub_vector_cache[neighbor_node_id],
+                                 /* asymmetric = */ true);
+      if (_collect_stats) {
+        _distance_computations.fetch_add(1);
+      }
+      accept(neighbor_node_id, dist);
+    }
+
+    if (cxl_pending) {
+      if (cxl_async) {
+        recvDistancesCxl(static_cast<uint32_t>(tl_cxl_batch_ids.size()),
+                         tl_cxl_batch_dists.data());
+      }
       if (_collect_stats) {
         _distance_computations.fetch_add(tl_cxl_batch_ids.size());
       }
-
       for (size_t k = 0; k < tl_cxl_batch_ids.size(); k++) {
-        node_id_t neighbor_node_id = tl_cxl_batch_ids[k];
-        float dist = tl_cxl_batch_dists[k];
-
-        if (neighbors.size() < buffer_size || dist < max_dist) {
-          candidates.emplace(-dist, neighbor_node_id);
-          neighbors.emplace(dist, neighbor_node_id);
-#ifdef FLATNAV_PROFILE_PQ
-          // Node enters the PQ now (discovered during the current expansion).
-          tl_disc[neighbor_node_id] = tl_step;
-          tl_parent_res[neighbor_node_id] = tl_cur_residency;
-#endif
-          if (neighbors.size() > buffer_size) {
-            neighbors.pop();
-          }
-          if (!neighbors.empty()) {
-            max_dist = neighbors.top().first;
-          }
-        }
+        accept(tl_cxl_batch_ids[k], tl_cxl_batch_dists[k]);
       }
     }
 #endif

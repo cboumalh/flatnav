@@ -16,11 +16,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <numeric>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -160,6 +162,33 @@ int main(int argc, char** argv) {
   index->setNumThreads(static_cast<uint32_t>(threads));
   printf("[cxl] search threads=%d (must be <= distance server --threads)\n", threads);
   fflush(stdout);
+
+  // Hub-node caching: top FLATNAV_HUB_CACHE_PCT percent of nodes by in-degree
+  // (default 1%) get their vectors cached host-side (see Index::cacheHubVectors),
+  // so processCandidateNode computes their distances locally instead of
+  // round-tripping to the distance server for them.
+  {
+    const char* hub_pct_env = getenv("FLATNAV_HUB_CACHE_PCT");
+    double hub_pct = hub_pct_env ? atof(hub_pct_env) : 1.0;
+
+    auto t0 = clk::now();
+    auto indeg = index->computeInDegrees();
+    std::vector<uint32_t> order(indeg.size());
+    std::iota(order.begin(), order.end(), 0u);
+    size_t num_hubs = std::min(order.size(),
+                               static_cast<size_t>(order.size() * hub_pct / 100.0));
+    if (num_hubs > 0) {
+      std::nth_element(order.begin(), order.begin() + num_hubs, order.end(),
+                       [&](uint32_t a, uint32_t b) { return indeg[a] > indeg[b]; });
+    }
+    std::vector<uint32_t> hub_nodes(order.begin(), order.begin() + num_hubs);
+    index->setHubNodeFlags(hub_nodes);
+    index->cacheHubVectors();
+    printf("[hub] cached %zu/%zu nodes (%.3f%%) in %.1fs\n",
+           num_hubs, indeg.size(), hub_pct,
+           std::chrono::duration<double>(clk::now() - t0).count());
+    fflush(stdout);
+  }
 #endif
 
   auto runBatch = [&](int ef) {
