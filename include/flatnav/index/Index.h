@@ -1401,7 +1401,13 @@ public:
       // after the non-hub batch's CXL request has been sent (not yet
       // waited on), so that local compute overlaps the round trip instead
       // of happening serially before it.
-      if (_hub_vector_cache && _hub_vector_cache[neighbor_node_id]) {
+      //
+      // Gate on _hub_nodes (1 byte/entry) rather than _hub_vector_cache
+      // (8 bytes/entry, sparse) so the common non-hub case only touches the
+      // smaller, more cache-friendly array. cacheHubVectors() only ever
+      // populates _hub_vector_cache[node] where _hub_nodes[node] is true,
+      // so once that's confirmed the pointer is known non-null.
+      if (_hub_vector_cache && _hub_nodes[neighbor_node_id]) {
         tl_hub_ids.push_back(neighbor_node_id);
       } else {
         tl_cxl_batch_ids.push_back(neighbor_node_id);
